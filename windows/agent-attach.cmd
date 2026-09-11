@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 if "%~1"=="" (
     echo Usage: agent-attach ^<file_path^> [prompt]
     exit /b 1

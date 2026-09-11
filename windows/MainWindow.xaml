@@ -4,7 +4,6 @@
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
         Title="DeepSeek" Height="860" Width="1240"
         WindowStartupLocation="CenterScreen"
-        Icon="AppIcon.ico"
         Background="#181C27"
         KeyDown="Window_KeyDown">
     <Grid>
@@ -20,7 +19,7 @@
                 <MenuItem Header="退出(_X)" InputGestureText="Alt+F4" Click="MenuExit_Click"/>
             </MenuItem>
             <MenuItem Header="Agent 闭环(_A)">
-                <MenuItem Header="⚡️ 注入大脑协议(_I)" InputGestureText="Ctrl+I" Click="MenuInjectPrompt_Click"/>
+                <MenuItem Header="注入大脑协议(_I)" InputGestureText="Ctrl+I" Click="MenuInjectPrompt_Click"/>
             </MenuItem>
             <MenuItem Header="视图(_V)">
                 <MenuItem Header="刷新(_R)" InputGestureText="Ctrl+R" Click="MenuReload_Click"/>

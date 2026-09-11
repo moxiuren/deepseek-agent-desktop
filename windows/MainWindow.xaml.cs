@@ -19,6 +19,22 @@ namespace DeepSeek
         public MainWindow()
         {
             InitializeComponent();
+            try
+            {
+                string exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                if (File.Exists(exePath))
+                {
+                    using var icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                    if (icon != null)
+                    {
+                        Icon = System.Windows.Interop.Imaging.CreateBitmapSourceFromHIcon(
+                            icon.Handle,
+                            Int32Rect.Empty,
+                            System.Windows.Media.Imaging.BitmapSizeOptions.FromEmptyOptions());
+                    }
+                }
+            }
+            catch {}
             Loaded += MainWindow_Loaded;
         }
 
@@ -108,7 +124,7 @@ namespace DeepSeek
         {
             try
             {
-                using var doc = JsonDocument.Parse(e.WebMessageAsString);
+                using var doc = JsonDocument.Parse(e.WebMessageAsJson);
                 var root = doc.RootElement;
                 if (!root.TryGetProperty("action", out var actionProp)) return;
                 string action = actionProp.GetString() ?? "";
@@ -197,12 +213,177 @@ namespace DeepSeek
             }
         }
 
+        private async Task<bool> TryHandleBuiltInCommandAsync(string id, string command)
+        {
+            string trimmed = command.Trim();
+            if (trimmed.Equals("agent-screenshot", StringComparison.OrdinalIgnoreCase) ||
+                trimmed.StartsWith("agent-screenshot ", StringComparison.OrdinalIgnoreCase))
+            {
+                await CaptureScreenAndAttachAsync(id);
+                return true;
+            }
+            if (trimmed.StartsWith("agent-attach ", StringComparison.OrdinalIgnoreCase))
+            {
+                string rest = trimmed.Substring("agent-attach ".Length).Trim();
+                await HandleAgentAttachCommandAsync(id, rest);
+                return true;
+            }
+            return false;
+        }
+
+        private async Task CaptureScreenAndAttachAsync(string id)
+        {
+            try
+            {
+                int screenWidth = (int)SystemParameters.PrimaryScreenWidth;
+                int screenHeight = (int)SystemParameters.PrimaryScreenHeight;
+
+                using var bitmap = new System.Drawing.Bitmap(screenWidth, screenHeight);
+                using (var g = System.Drawing.Graphics.FromImage(bitmap))
+                {
+                    g.CopyFromScreen(0, 0, 0, 0, new System.Drawing.Size(screenWidth, screenHeight));
+                }
+
+                string tempPath = Path.Combine(Path.GetTempPath(), $"deepseek_screenshot_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.png");
+                bitmap.Save(tempPath, System.Drawing.Imaging.ImageFormat.Png);
+
+                byte[] fileBytes = await File.ReadAllBytesAsync(tempPath);
+                string b64 = Convert.ToBase64String(fileBytes);
+                string filename = Path.GetFileName(tempPath);
+                string prompt = "屏幕截图已捕获，请查看附件图片进行分析与判断。";
+
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var attachPayload = new
+                    {
+                        id = id,
+                        exitCode = 0,
+                        isAttachment = true,
+                        filename = filename,
+                        mimeType = "image/png",
+                        base64Data = b64,
+                        prompt = prompt
+                    };
+                    string json = JsonSerializer.Serialize(attachPayload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var payload = new
+                    {
+                        id = id,
+                        exitCode = 1,
+                        output = $"[错误] 原生截屏失败: {ex.Message}"
+                    };
+                    string json = JsonSerializer.Serialize(payload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+        }
+
+        private async Task HandleAgentAttachCommandAsync(string id, string arguments)
+        {
+            try
+            {
+                string filePath = arguments;
+                string prompt = "文件已作为附件挂载，请直接阅读分析。";
+
+                if (filePath.StartsWith("\""))
+                {
+                    int nextQuote = filePath.IndexOf('\"', 1);
+                    if (nextQuote > 0)
+                    {
+                        string p = filePath.Substring(1, nextQuote - 1);
+                        string remaining = filePath.Substring(nextQuote + 1).Trim();
+                        filePath = p;
+                        if (!string.IsNullOrEmpty(remaining))
+                        {
+                            prompt = remaining.Trim('\"');
+                        }
+                    }
+                }
+                else
+                {
+                    string[] parts = filePath.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length > 0) filePath = parts[0];
+                    if (parts.Length > 1) prompt = parts[1].Trim('\"');
+                }
+
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
+                string workingDir = Directory.Exists(projectsDir) ? projectsDir : userProfile;
+
+                string resolvedPath = Environment.ExpandEnvironmentVariables(filePath);
+                if (resolvedPath.StartsWith("~"))
+                {
+                    resolvedPath = Path.Combine(userProfile, resolvedPath.TrimStart('~', '/', '\\'));
+                }
+                else if (!Path.IsPathRooted(resolvedPath))
+                {
+                    resolvedPath = Path.Combine(workingDir, resolvedPath);
+                }
+
+                if (!File.Exists(resolvedPath))
+                {
+                    throw new FileNotFoundException($"文件不存在: {resolvedPath}");
+                }
+
+                byte[] fileBytes = await File.ReadAllBytesAsync(resolvedPath);
+                string b64 = Convert.ToBase64String(fileBytes);
+                string filename = Path.GetFileName(resolvedPath);
+                string mime = GetMimeType(Path.GetExtension(resolvedPath));
+
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var attachPayload = new
+                    {
+                        id = id,
+                        exitCode = 0,
+                        isAttachment = true,
+                        filename = filename,
+                        mimeType = mime,
+                        base64Data = b64,
+                        prompt = prompt
+                    };
+                    string json = JsonSerializer.Serialize(attachPayload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var payload = new
+                    {
+                        id = id,
+                        exitCode = 1,
+                        output = $"[错误] 挂载附件失败: {ex.Message}"
+                    };
+                    string json = JsonSerializer.Serialize(payload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+        }
+
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
             if (_isExecuting) return;
             _isExecuting = true;
 
             Console.WriteLine($"[Native Bridge] >>> EXECUTING COMMAND (ID: {id}):\n{command}");
+
+            if (await TryHandleBuiltInCommandAsync(id, command))
+            {
+                _isExecuting = false;
+                return;
+            }
 
             string output = "";
             int exitCode = -1;
