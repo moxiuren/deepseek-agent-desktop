@@ -38,7 +38,7 @@ namespace DeepSeek
         // Direct API Send (bypassing input box) is toggleable via:
         //   set DEEPSEEK_DIRECT_SEND=1  (environment variable), or
         //   create empty file %LOCALAPPDATA%\DeepSeek-Agent\direct_send.enable
-        public static readonly bool DirectSendEnabled = CheckDirectSend();
+        public static bool DirectSendEnabled => CheckDirectSend();
 
         private static bool CheckDiagnostics()
         {

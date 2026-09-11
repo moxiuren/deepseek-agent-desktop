@@ -1190,7 +1190,7 @@ ${output}
 \`\`\`
 (注：附件未能挂载显示，已转纯文本反馈，请继续。若需继续执行请输出 \`\`\`local_cmd 代码块，若完成请直接解答。)`;
 
-            let countdown = (isAttachment && fileObj) ? 1 : 3;
+            let countdown = (isAttachment && fileObj) ? 1 : 2;
             if (controller) {
                 controller.showPacing(countdown, () => {
                     if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
@@ -1407,6 +1407,13 @@ ${output}
             return;
         }
 
+        // When auto-sending, visually mask the textarea during injection
+        // so huge terminal feedback does not awkwardly sit in the user's view.
+        const origOpacity = textarea.style.opacity;
+        if (autoSend) {
+            textarea.style.opacity = '0.01';
+        }
+
         if (textarea.tagName === 'TEXTAREA') {
             setNativeValue(textarea, text);
         } else {
@@ -1416,10 +1423,21 @@ ${output}
         }
 
         if (autoSend) {
-            setTimeout(() => {
-                triggerSend();
-                setTimeout(collapseToolFeedbackBubbles, 600);
-            }, 500);
+            // Rapid send: poll every 25ms up to 300ms for button readiness instead of 500ms delay
+            let tries = 0;
+            const clickIv = setInterval(() => {
+                tries++;
+                const btn = findSendButton();
+                if ((btn && !isControlDisabled(btn)) || tries >= 12) {
+                    clearInterval(clickIv);
+                    triggerSend();
+                    setTimeout(() => {
+                        try { textarea.style.opacity = origOpacity || ''; } catch (_) {}
+                    }, 80);
+                    burstCollapse();
+                    setTimeout(collapseToolFeedbackBubbles, 300);
+                }
+            }, 25);
         }
     }
 
