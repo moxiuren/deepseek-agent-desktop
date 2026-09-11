@@ -18,14 +18,37 @@ using Microsoft.Web.WebView2.Core;
 
 namespace DeepSeek
 {
+    // Pass-through cmdlet for live streaming: forwards each pipeline object's
+    // text to the tool card immediately, then passes the object downstream
+    // untouched (Out-String still does the final formatted rendering).
+    // Needed because Format*/Out-String buffer until upstream completes.
+    [Cmdlet("Write", "LiveStream")]
+    public sealed class LiveStreamCmdlet : Cmdlet
+    {
+        public static Action<string>? Sink;
+
+        [Parameter(ValueFromPipeline = true)]
+        public PSObject? InputObject { get; set; }
+
+        protected override void ProcessRecord()
+        {
+            var o = InputObject;
+            try { Sink?.Invoke(o?.ToString() ?? ""); } catch { }
+            WriteObject(o);
+        }
+    }
+
     public partial class MainWindow : Window
     {
-        private bool _isExecuting = false;
+        // Serialize native executions: concurrent dispatches QUEUE on this gate
+        // instead of being silently dropped (a drop leaves the planner waiting
+        // forever and misattributes later results).
+        private readonly SemaphoreSlim _execGate = new(1, 1);
         private long _lastDropTimestamp = 0;
         private long _lastInjectTicks = 0;
 
         // Persistent runspace: kills per-command powershell.exe spawn (~200-500ms each).
-        // Session persists across commands (cwd, variables, $env:), commands stay serialized via _isExecuting.
+        // Session persists across commands (cwd, variables, $env:), commands stay serialized via _execGate.
         private Runspace? _runspace;
         private readonly object _poolLock = new();
 
@@ -50,6 +73,7 @@ namespace DeepSeek
 
                 var iss = InitialSessionState.CreateDefault();
                 iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+                iss.Commands.Add(new SessionStateCmdletEntry("Write-LiveStream", typeof(LiveStreamCmdlet), null));
                 var rs = RunspaceFactory.CreateRunspace(iss);
                 rs.Open();
 
@@ -535,6 +559,32 @@ namespace DeepSeek
 
         private async Task HandleFileWriteAsync(string id, string path, string content)
         {
+            async Task RejectWriteAsync(string reason)
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var payload = new { id = id, exitCode = 1, output = reason };
+                    string json = JsonSerializer.Serialize(payload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+
+            // Depth defense: reject UI-residue paths and suspicious near-empty writes.
+            // Rejections ALWAYS feed back (never silent) so the planner can adjust.
+            if (path.Contains("CopyDownload"))
+            {
+                App.Log($"[write_file] 路径污染拦截: {path}");
+                await RejectWriteAsync($"[拒绝写入] 路径疑似携带页面按钮残留文本: {path}。请检查 fence 标注后重试，或改用 local_cmd 写入。");
+                return;
+            }
+            if ((content?.Length ?? 0) < 8 && !path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+            {
+                App.Log($"[write_file] 拒绝可疑空写入: {path} (content {content?.Length ?? 0} chars)");
+                await RejectWriteAsync($"[拒绝写入] 内容过短({content?.Length ?? 0} 字符)且目标非 .txt：{path}。若确需写入请改用 local_cmd，或分步确认后重试。");
+                return;
+            }
+
             try
             {
                 string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -554,7 +604,7 @@ namespace DeepSeek
                 string dir = Path.GetDirectoryName(resolvedPath) ?? workingDir;
                 Directory.CreateDirectory(dir);
 
-                await File.WriteAllTextAsync(resolvedPath, content, Encoding.UTF8);
+                await File.WriteAllTextAsync(resolvedPath, content, new UTF8Encoding(false));
 
                 await Dispatcher.InvokeAsync(async () =>
                 {
@@ -745,18 +795,47 @@ namespace DeepSeek
             }
         }
 
+        private static string FormatErrorRecord(ErrorRecord e)
+        {
+            string msg = e.ErrorDetails?.Message ?? e.Exception?.Message ?? e.ToString();
+            string at = e.InvocationInfo?.Line?.Trim() ?? "";
+            if (!string.IsNullOrEmpty(at) && !msg.Contains(at))
+                msg += $" (at: {at})";
+            return msg;
+        }
+
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
-            if (_isExecuting) return;
-            _isExecuting = true;
-
-            Console.WriteLine($"[Native Bridge] >>> EXECUTING COMMAND (ID: {id}):\n{command}");
-
-            if (await TryHandleBuiltInCommandAsync(id, command))
+            bool gateTaken = false;
+            try { gateTaken = await _execGate.WaitAsync(TimeSpan.FromSeconds(120)); } catch { gateTaken = false; }
+            if (!gateTaken)
             {
-                _isExecuting = false;
+                string qOut = "【本地执行排队超时（120 秒），上一条命令仍在运行，请稍后重试】";
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    try
+                    {
+                        var payload = new { id = id, exitCode = 124, output = qOut };
+                        string jsonString = JsonSerializer.Serialize(payload);
+                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";
+                        await webView.CoreWebView2.ExecuteScriptAsync(js);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
+                    }
+                });
                 return;
             }
+
+            try
+            {
+                Console.WriteLine($"[Native Bridge] >>> EXECUTING COMMAND (ID: {id}):\n{command}");
+
+                if (await TryHandleBuiltInCommandAsync(id, command))
+                {
+                    return;
+                }
 
             string output = "";
             int exitCode = -1;
@@ -773,21 +852,95 @@ namespace DeepSeek
                 using var ps = System.Management.Automation.PowerShell.Create();
                 ps.Runspace = runspace;
                 ps.AddScript("$ProgressPreference='SilentlyContinue'; " + command);
+                // Live tap BEFORE Out-String: Write-LiveStream forwards each object's
+                // text immediately (Out-String would buffer until upstream completes).
+                ps.AddCommand("Write-LiveStream");
                 ps.AddCommand("Out-String").AddParameter("Width", 1024).AddParameter("Stream", true);
 
-                Collection<PSObject>? results = null;
+                // Live streaming: push each output/error line to the tool card as it
+                // arrives (capped; the final result stays authoritative).
+                int streamedChunks = 0;
+                const int MaxStreamChunks = 1000;
+                void StreamChunk(string chunk)
+                {
+                    if (string.IsNullOrEmpty(chunk)) return;
+                    int n = Interlocked.Increment(ref streamedChunks);
+                    if (n > MaxStreamChunks) return;
+                    if (n == MaxStreamChunks)
+                        chunk += "\n[实时流达到上限，后续输出完成后统一显示]";
+                    string capturedId = id;
+                    _ = Dispatcher.InvokeAsync(async () =>
+                    {
+                        for (int attempt = 0; attempt < 2; attempt++)
+                        {
+                            try
+                            {
+                                if (webView?.CoreWebView2 == null) return;
+                                string payload = JsonSerializer.Serialize(new { id = capturedId, chunk = chunk });
+                                await webView.CoreWebView2.ExecuteScriptAsync(
+                                    $"window.__agentBridge && window.__agentBridge.onCommandStream({payload});");
+                                return;
+                            }
+                            catch
+                            {
+                                if (attempt == 0) { try { await Task.Delay(300); } catch { } }
+                            }
+                        }
+                    });
+                }
+                // Live tap sink (executions are serialized, one at a time).
+                LiveStreamCmdlet.Sink = line => { if (!string.IsNullOrEmpty(line)) StreamChunk(line); };
+                var outputCol = new PSDataCollection<PSObject>();
+                outputCol.DataAdded += (sender, e) =>
+                {
+                    string? line = null;
+                    try { line = ((PSDataCollection<PSObject>)sender)[e.Index]?.ToString(); } catch { return; }
+                    if (!string.IsNullOrEmpty(line)) StreamChunk(line);
+                };
+                ps.Streams.Error.DataAdded += (sender, e) =>
+                {
+                    string msg;
+                    try { msg = FormatErrorRecord(((PSDataCollection<ErrorRecord>)sender)[e.Index]); }
+                    catch { return; }
+                    StreamChunk("[STDERR] " + msg);
+                };
+
+                System.Collections.Generic.IList<PSObject>? results = null;
                 Exception? invokeEx = null;
                 var invokeTask = Task.Run(() =>
                 {
-                    try { results = ps.Invoke(); }
-                    catch (Exception ex) { invokeEx = ex; }
+                    IAsyncResult ar;
+                    try { ar = ps.BeginInvoke<PSObject, PSObject>(null, outputCol); }
+                    catch (Exception ex) { invokeEx = ex; results = outputCol; return; }
+                    try
+                    {
+                        // Wait indefinitely here; the outer 180s timeout stops the pipeline.
+                        // Stop() unblocks this and EndInvoke surfaces partial output.
+                        ar.AsyncWaitHandle.WaitOne();
+                        try { ps.EndInvoke(ar); }
+                        catch (Exception ex) { invokeEx = ex; }
+                    }
+                    finally { results = outputCol; }
                 });
                 var finished = await Task.WhenAny(invokeTask, Task.Delay(TimeSpan.FromSeconds(180)));
-                if (finished != invokeTask)
+                bool timedOut = finished != invokeTask;
+                if (timedOut)
                 {
-                    try { ps.Stop(); } catch {}
-                    try { await invokeTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch {}
+                    try { ps.Stop(); } catch { }
+                    try { await invokeTask.WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
                     exitCode = 124;
+                    // Keep partial output captured before the stop.
+                    if (results != null)
+                    {
+                        foreach (var o in results)
+                        {
+                            if (o != null) outSb.AppendLine(o.ToString());
+                        }
+                    }
+                    foreach (var e in ps.Streams.Error)
+                    {
+                        errSb.AppendLine(FormatErrorRecord(e));
+                    }
                     errSb.AppendLine("【命令执行超时中断 (超过 180 秒)】");
                 }
                 else
@@ -809,14 +962,11 @@ namespace DeepSeek
                     foreach (var e in ps.Streams.Error)
                     {
                         hadErrors = true;
-                        string msg = e.ErrorDetails?.Message ?? e.Exception?.Message ?? e.ToString();
-                        string at = e.InvocationInfo?.Line?.Trim() ?? "";
-                        if (!string.IsNullOrEmpty(at) && !msg.Contains(at))
-                            msg += $" (at: {at})";
-                        errSb.AppendLine(msg);
+                        errSb.AppendLine(FormatErrorRecord(e));
                     }
                     exitCode = hadErrors ? 1 : 0;
                 }
+                LiveStreamCmdlet.Sink = null;
 
                 string outStr = outSb.ToString();
                 string errStr = errSb.ToString();
@@ -911,12 +1061,9 @@ namespace DeepSeek
             catch (Exception ex)
             {
                 exitCode = -1;
+                LiveStreamCmdlet.Sink = null;
                 output = $"执行失败: {ex.Message}";
                 App.Log($"[Execute] FAILED id={id} cmd-head={command.Substring(0, Math.Min(120, command.Length))} ex={ex}");
-            }
-            finally
-            {
-                _isExecuting = false;
             }
 
             // Feed result back to WebView2
@@ -939,6 +1086,12 @@ namespace DeepSeek
                     Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
                 }
             });
+            }
+            finally
+            {
+                LiveStreamCmdlet.Sink = null;
+                if (gateTaken) { try { _execGate.Release(); } catch {} }
+            }
         }
 
         private static string GetMimeType(string ext)

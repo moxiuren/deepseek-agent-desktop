@@ -2,9 +2,9 @@
 // Injected at document-creation (before page scripts). Wraps fetch/XHR, never alters
 // requests or responses. All records go to the native host log (local file only).
 (function() {
-    if (window.__apiSniffInstalled) return;
+    // Re-entry guard via the functional global (no extra marker global).
+    if (window.__uploadState) return;
     try { if (window !== window.top) return; } catch (_) {}
-    window.__apiSniffInstalled = true;
 
     function toNative(payload) {
         try {
@@ -114,10 +114,24 @@
         } catch (_) {}
     }
 
+    // --- stealth: Proxy wrappers pass BOTH `fn.toString()` and
+    // `Function.prototype.toString.call(fn)` native-code checks, because the
+    // proxy forwards toString to the untouched original target.
+    function stealthWrap(fn, applyTrap) {
+        try {
+            return new Proxy(fn, {
+                apply: function(t, th, args) { return applyTrap(t, th, args); }
+            });
+        } catch (_) {
+            return fn;
+        }
+    }
+
     // --- fetch ---
     try {
-        var origFetch = window.fetch.bind(window);
-        window.fetch = function(input, init) {
+        window.fetch = stealthWrap(window.fetch, function(t, th, args) {
+            var input = args.length > 0 ? args[0] : undefined;
+            var init = args.length > 1 ? args[1] : undefined;
             var url = '';
             var method = 'GET';
             var skipped = false;
@@ -140,7 +154,7 @@
                     emit(rec);
                 }
             } catch (_) {}
-            return origFetch.apply(null, arguments).then(function(res) {
+            return Reflect.apply(t, th, args).then(function(res) {
                 uploadRes(res.url);
                 if (isPowUrl(res.url)) {
                     // Small JSON challenge — safe to buffer for backchannel design.
@@ -162,33 +176,31 @@
                 try { uploadRes(url); } catch (_) {}
                 throw err;
             });
-        };
+        });
     } catch (_) {}
 
     // --- XHR ---
     try {
-        var origOpen = XMLHttpRequest.prototype.open;
-        var origSend = XMLHttpRequest.prototype.send;
-        var origSetRH = XMLHttpRequest.prototype.setRequestHeader;
-        XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
-            try { (this.__sniffHeaders = this.__sniffHeaders || []).push(String(k)); } catch (_) {}
-            return origSetRH.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.open = function(method, url) {
-            try { this.__sniffMethod = method; this.__sniffUrl = url; } catch (_) {}
-            return origOpen.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function(body) {
+        XMLHttpRequest.prototype.setRequestHeader = stealthWrap(XMLHttpRequest.prototype.setRequestHeader, function(t, th, args) {
+            try { (th.__sniffHeaders = th.__sniffHeaders || []).push(String(args[0])); } catch (_) {}
+            return Reflect.apply(t, th, args);
+        });
+        XMLHttpRequest.prototype.open = stealthWrap(XMLHttpRequest.prototype.open, function(t, th, args) {
+            try { th.__sniffMethod = args[0]; th.__sniffUrl = args[1]; } catch (_) {}
+            return Reflect.apply(t, th, args);
+        });
+        XMLHttpRequest.prototype.send = stealthWrap(XMLHttpRequest.prototype.send, function(t, th, args) {
+            var body = args.length > 0 ? args[0] : undefined;
             var skipped = false;
             try {
-                skipped = shouldSkip(this.__sniffUrl || '');
-                if (String(this.__sniffMethod || '').toUpperCase() === 'POST') {
-                    uploadReq(this.__sniffUrl || '');
-                    if (isCompletionUrl(this.__sniffUrl || '')) {
+                skipped = shouldSkip(th.__sniffUrl || '');
+                if (String(th.__sniffMethod || '').toUpperCase() === 'POST') {
+                    uploadReq(th.__sniffUrl || '');
+                    if (isCompletionUrl(th.__sniffUrl || '')) {
                         try { window.__lastCompletionAt = Date.now(); } catch (_) {}
                     }
                 }
-                var self = this;
+                var self = th;
                 var finish = function(emitRes) {
                     try { uploadRes(self.__sniffUrl || ''); } catch (_) {}
                     if (!emitRes) return;
@@ -201,21 +213,21 @@
                     } catch (_) {}
                 };
                 if (!skipped) {
-                    var reqRec = { side: 'xhr-req', method: String(this.__sniffMethod || ''), url: String(this.__sniffUrl || '').slice(0, 500), body: summarizeBody(body) };
-                    if (isInterestingUrl(this.__sniffUrl || '')) {
-                        reqRec.headerNames = self.__sniffHeaders || [];
+                    var reqRec = { side: 'xhr-req', method: String(th.__sniffMethod || ''), url: String(th.__sniffUrl || '').slice(0, 500), body: summarizeBody(body) };
+                    if (isInterestingUrl(th.__sniffUrl || '')) {
+                        reqRec.headerNames = th.__sniffHeaders || [];
                     }
                     emit(reqRec);
-                    this.addEventListener('load', function() { finish(true); });
-                    this.addEventListener('error', function() { finish(true); });
-                    this.addEventListener('abort', function() { finish(true); });
+                    th.addEventListener('load', function() { finish(true); });
+                    th.addEventListener('error', function() { finish(true); });
+                    th.addEventListener('abort', function() { finish(true); });
                 } else {
-                    this.addEventListener('load', function() { finish(false); });
-                    this.addEventListener('error', function() { finish(false); });
-                    this.addEventListener('abort', function() { finish(false); });
+                    th.addEventListener('load', function() { finish(false); });
+                    th.addEventListener('error', function() { finish(false); });
+                    th.addEventListener('abort', function() { finish(false); });
                 }
             } catch (_) {}
-            return origSend.apply(this, arguments);
-        };
+            return Reflect.apply(t, th, args);
+        });
     } catch (_) {}
 })();

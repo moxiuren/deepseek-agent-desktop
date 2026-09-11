@@ -1,6 +1,6 @@
 (function() {
-    if (window.__agentBridgeInstalled) return;
-    window.__agentBridgeInstalled = true;
+    // Re-entry guard via the functional export (no extra marker global).
+    if (window.__agentBridge) return;
     // Defence-in-depth: any unexpected init failure must be LOUD, never silently leave the
     // native side calling into an undefined window.__agentBridge.
     try {
@@ -41,66 +41,21 @@
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
     const osPlatform = isWindows ? "Windows (PowerShell)" : "macOS (Zsh)";
-    const cmdGuide = isWindows
-        ? "- **系统命令负责文件与环境操作**：查看文件、检索目录、运行测试直接使用标准 PowerShell 命令（如 `dir` / `Get-ChildItem`、`cat` / `Get-Content`、`git`、`python`）。"
-        : "- **系统命令负责文件与环境操作**：查看文件、检索目录、运行测试直接使用标准 bash/zsh（如 `cat`、`ls`、`git`、`python3`）。";
-    const exampleCmd = isWindows
-        ? "dir ~\ncat 文件路径\npython 脚本路径"
-        : "ls -la ~/Documents/Projects\ncat 文件路径\npython3 脚本路径";
 
     const SYSTEM_PROMPT = `【系统协议：本地 ${osPlatform} Agent 闭环模式已激活】
-你现在作为指挥大脑（Brain / Planner），拥有控制我本地电脑的执行权限。
-本地已连接极速代码执行引擎：\`agy\`（模型：Gemini 3.8 Flash Low，无思考开销，极速纯执行）。
+你是 DeepSeek Agent（第六位本地 Agent），拥有控制本机的执行权限。
+开工第一步：先用 local_cmd 读你的灵魂文件 \`C:/Users/Admin/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md\`，读完简短确认，之后一切按它行事（它是你唯一的长效记忆契约，会话重启即失忆）。
 
-【分工原则】：
-- **你（DeepSeek）负责全部大脑思考与设计**：由你负责逻辑推演、架构规划、分步决策，不要让执行者再次思考；
-- **agy 负责极速生成代码 / 纯执行**：agy 不进行深度思考，你必须在指令中给它极其完整、无歧义的具体代码实现要求；
-${cmdGuide}
-
-【执行协议】：
-当你需要让本地模型编写或修改代码时，直接输出以下格式（agy 已在 PATH，无需写路径）：
+【你有的能力】（每轮只输出一个代码块，真实结果会自动回来）：
 \`\`\`local_cmd
-agy -p "请根据以下完整要求生成代码：<你的详细完整指令>" --model gemini-3.8-flash-low --effort low --dangerously-skip-permissions
+<PowerShell 命令> 或 agy -p "<完整无歧义指令>" --model gemini-3.8-flash-low --effort low --dangerously-skip-permissions
 \`\`\`
-- \`-p\` = 非交互单次执行并打印结果（必须带，否则进入交互卡死直到超时）；
-- \`--dangerously-skip-permissions\` = 自动放行工具权限（必须带，否则停住等确认直到超时）；
-- 操作 Documents\\Projects 以外目录时追加 \`--add-dir "目标目录"\`；
-- 禁止事项：不要用 \`agy-run\`（不存在）；不要裸打 \`agy models\`（那只是查模型列表）；不要省略 -p。
+\`\`\`write_file:目标路径
+文件内容
+\`\`\`
+（查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
-当你需要查看文件、探索目录或执行系统脚本时，直接输出命令：
-\`\`\`local_cmd
-${exampleCmd}
-\`\`\`
-
-【闭环规则】：
-1. 每次只输出需要执行的命令代码块，不要自行编造虚假结果；
-2. 本地系统会自动在终端执行该命令，并将真实的退出码和输出结果作为下一轮消息直接反馈给你；
-3. 收到真实反馈后，你根据结果进行下一阶段思考与决策（继续输出 \`local_cmd\` 或回答用户）；
-4. 所有任务最终完成时，无需输出 \`local_cmd\`，直接给出最终总结与解答。
-
-【文件直接落盘写文件协议 (免除任何 Shell 转义与拼接)】：
-当你需要创建、编写或修改一个文件时，无需使用 cat 或 echo 命令，直接输出带有目标路径的代码块：
-\`\`\`write_file:相对或绝对文件路径
-你的完整代码内容（原汁原味，零转义损坏）
-\`\`\`
-或者在代码块首行注明文件路径：
-\`\`\`python
-# file: 相对或绝对文件路径
-你的完整代码内容
-\`\`\`
-本地系统会自动递归创建父目录并将代码原子落盘写入指定位置！若写完需运行测试，紧随其后输出 \`\`\`local_cmd 代码块即可。
-
-【视觉感知与附件扩展能力】：
-- **截取桌面屏幕视觉**：若需查看当前桌面、GUI 窗口布局、网页渲染或排版效果，直接输出：
-\`\`\`local_cmd
-agent-screenshot
-\`\`\`
-系统将自动抓取当前屏幕并作为图片附件挂载发送给你，下一轮你将直接获得完整视觉图像！
-- **挂载任意大文件**：若需阅读大文件（支持最大 100MB），输出：
-\`\`\`local_cmd
-agent-attach 文件路径 "说明或提示"
-\`\`\`
-- **长输出防爆**：终端命令的超长输出（> 6KB）系统会自动为你打包为附件上传，不会撑爆输入框与上下文。
+【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
 请确认收到，并等待用户指令。`;
 
     let autoExecute = true;
@@ -305,6 +260,19 @@ agent-attach 文件路径 "说明或提示"
         return hasSlash || hasExt || isSpecialFile;
     }
 
+    // Path sanitizer for write_file candidates: strips UI button residue and
+    // trailing punctuation, then enforces isValidFilePath. Branches 1-3 MUST
+    // go through this (they previously accepted any non-space token, so words
+    // like "in"/"is" or placeholders became real files).
+    function cleanPathCandidate(raw) {
+        if (!raw || typeof raw !== 'string') return null;
+        let p = raw.trim().replace(/^["'`]|["'`]$/g, '').trim();
+        p = p.replace(/(?:Copy|Download|复制|下载)+$/g, '').trim();
+        p = p.replace(/[.,;:)\]}`'"]+$/g, '').trim();
+        if (!p || p.length < 2) return null;
+        return isValidFilePath(p) ? p : null;
+    }
+
     function detectFileWriteBlock(blockNode) {
         if (!blockNode) return null;
 
@@ -320,25 +288,30 @@ agent-attach 文件路径 "说明或提示"
         // 1. Explicit write_file: in banner or header
         let m = bannerText.match(/(?:write_file|write-file):\s*([^\s\n\r]+)/i);
         if (m && m[1]) {
-            filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
-            isExplicitWriteFile = true;
+            filePath = cleanPathCandidate(m[1]);
+            isExplicitWriteFile = !!filePath;
         }
 
         // 2. Explicit write_file: in code class (e.g. language-write_file:path)
         if (!filePath && codeClass) {
             m = codeClass.match(/language-(?:write_file|write-file):([^\s]+)/i);
             if (m && m[1]) {
-                filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
-                isExplicitWriteFile = true;
+                filePath = cleanPathCandidate(m[1]);
+                isExplicitWriteFile = !!filePath;
             }
         }
 
-        // 3. Explicit write_file: in fullText (first line or standalone token)
+        // 3. Explicit write_file: fence tag at block START only (unanchored
+        // matches mid-discussion text, e.g. protocol explanations, which must
+        // never become files).
         if (!filePath) {
-            m = fullText.match(/write_file:\s*([^\s\n\r]+)/i);
-            if (m && m[1]) {
-                filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
-                isExplicitWriteFile = true;
+            const wIdx = fullText.search(/write_file:/i);
+            if (wIdx !== -1 && wIdx < 120) {
+                m = fullText.match(/write_file:\s*([^\s\n\r]+)/i);
+                if (m && m[1]) {
+                    filePath = cleanPathCandidate(m[1]);
+                    isExplicitWriteFile = !!filePath;
+                }
             }
         }
 
@@ -525,7 +498,14 @@ agent-attach 文件路径 "说明或提示"
                 out.textContent = output;
                 // Long outputs start folded (toggle to expand) so the page
                 // isn't a wall of terminal text; model still gets full text.
+                // If live streaming already showed content, keep the viewer's
+                // current folded/visible state instead of yanking it.
                 try {
+                    if (out.dataset.streaming) {
+                        const tog2 = document.getElementById(`${cardId}-output-toggle`);
+                        if (tog2) tog2.textContent = out.style.display === 'none' ? `展开输出 (${output.length} 字符)` : '收起输出';
+                        return;
+                    }
                     let tog = document.getElementById(`${cardId}-output-toggle`);
                     if (output && output.length > 600) {
                         out.style.display = 'none';
@@ -561,6 +541,23 @@ agent-attach 文件路径 "说明或提示"
             hidePacing: () => {
                 const bar = document.getElementById(`${cardId}-pacing-bar`);
                 if (bar) bar.style.display = 'none';
+            },
+            appendStream: (chunk) => {
+                const out = document.getElementById(`${cardId}-output-box`);
+                if (!out) return;
+                try {
+                    if (!out.dataset.streaming) {
+                        out.dataset.streaming = "1";
+                        out.textContent = "";
+                        out.style.color = "#34d399";
+                    }
+                    out.textContent += chunk + "\n";
+                    out.scrollTop = out.scrollHeight;
+                    const tog = document.getElementById(`${cardId}-output-toggle`);
+                    if (tog && out.style.display === 'none') {
+                        tog.textContent = `展开输出 (${out.textContent.length} 字符，仍在输出…)`;
+                    }
+                } catch (_) {}
             }
         };
 
@@ -586,11 +583,35 @@ agent-attach 文件路径 "说明或提示"
         const blocks = document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
         const now = Date.now();
 
+        // Scope whitelist: only blocks inside the LATEST message-like container
+        // may start a call. History blocks must never re-fire (ghost writes).
+        // Falls back to unscoped when the site DOM matches nothing.
+        let scanScope = null;
+        try {
+            const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]');
+            if (containers.length) scanScope = containers[containers.length - 1];
+        } catch (_) {}
+
         for (let el of blocks) {
             if (el.dataset.agentProcessed) continue;
 
             const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
             if (parent.dataset.agentProcessed) continue;
+
+            // Never scan our own UI (HUD / tool cards / collapsed pills).
+            try {
+                if (el.closest && el.closest('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill')) continue;
+            } catch (_) {}
+
+            // Never treat our own feedback bubbles as fresh calls: they quote
+            // previous output AND contain the local_cmd keyword in instructions,
+            // which would otherwise re-execute old results in a loop.
+            try {
+                const scopeText = parent.innerText || parent.textContent || '';
+                if (scopeText.includes('[Tool Call')) continue;
+            } catch (_) {}
+
+            if (scanScope && !scanScope.contains(parent)) continue;
 
             const fileInfo = detectFileWriteBlock(parent);
             const isFileWrite = !!fileInfo;
@@ -694,6 +715,14 @@ agent-attach 文件路径 "说明或提示"
         controller.hidePacing();
         controller.setStatus("正在执行本地命令...", "#d97706", true);
         controller.setOutput("[本地终端进程已启动，正在执行指令...]");
+        // Elapsed ticker so a long silent run doesn't look wedged.
+        try {
+            const t0 = Date.now();
+            if (controller._tickIv) clearInterval(controller._tickIv);
+            controller._tickIv = setInterval(() => {
+                try { controller.setStatus(`正在执行本地命令…（已运行 ${Math.round((Date.now() - t0) / 1000)}s）`, "#d97706", true); } catch (_) {}
+            }, 1000);
+        } catch (_) {}
         updateHUD("正在执行本地指令...", "#f59e0b");
 
         console.log("[Agent Bridge] Dispatching command to native host:\n", command);
@@ -1050,10 +1079,21 @@ agent-attach 文件路径 "说明或提示"
             });
             return out.join('\n');
         },
+        onCommandStream: function(data) {
+            // Live output chunk pushed by the native host during execution.
+            try {
+                const c = cardControllers[data && data.id];
+                if (c && c.appendStream && typeof data.chunk === 'string') c.appendStream(data.chunk);
+            } catch (_) {}
+        },
         onCommandResult: function(data) {
             isExecutingNow = false;
             const cardId = data.id;
             const exitCode = data.exitCode;
+            try {
+                const _c = cardControllers[cardId];
+                if (_c && _c._tickIv) { clearInterval(_c._tickIv); _c._tickIv = null; }
+            } catch (_) {}
             const output = data.output || "(执行完毕，无输出)";
             const isAttachment = !!data.isAttachment;
 
