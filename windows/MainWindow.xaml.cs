@@ -69,6 +69,57 @@ namespace DeepSeek
             App.Log("MainWindow.ctor exit");
         }
 
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint msg, uint action, IntPtr pChangeFilterStruct);
+
+        private const uint MSGFLT_ALLOW = 1;
+        private const int SW_RESTORE = 9;
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            var handle = new WindowInteropHelper(this).Handle;
+            try
+            {
+                ChangeWindowMessageFilterEx(handle, App.WM_SHOW_DEEPSEEK, MSGFLT_ALLOW, IntPtr.Zero);
+            }
+            catch {}
+            var source = HwndSource.FromHwnd(handle);
+            source?.AddHook(WndProc);
+            App.Log("MainWindow.OnSourceInitialized done, WndProc hook registered");
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if ((uint)msg == App.WM_SHOW_DEEPSEEK)
+            {
+                App.Log("[SingleInstance] Received WM_SHOW_DEEPSEEK message, restoring and activating window.");
+                Dispatcher.Invoke(() =>
+                {
+                    if (WindowState == WindowState.Minimized)
+                    {
+                        WindowState = WindowState.Normal;
+                    }
+                    var handle = new WindowInteropHelper(this).Handle;
+                    ShowWindow(handle, SW_RESTORE);
+                    SetForegroundWindow(handle);
+                    Activate();
+                    Topmost = true;
+                    Topmost = false;
+                    Focus();
+                });
+                handled = true;
+            }
+            return IntPtr.Zero;
+        }
+
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             App.Log("MainWindow_Loaded enter");
@@ -97,7 +148,20 @@ namespace DeepSeek
                 var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder, envOptions);
                 App.Log("CoreWebView2Environment.CreateAsync done");
 
-                await webView.EnsureCoreWebView2Async(env);
+                // Retry if 0x800700AA occurs (e.g. if previous process was closed recently and lock is still releasing)
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    try
+                    {
+                        await webView.EnsureCoreWebView2Async(env);
+                        break;
+                    }
+                    catch (System.Runtime.InteropServices.COMException comEx) when ((uint)comEx.ErrorCode == 0x800700AA && attempt < 3)
+                    {
+                        App.Log($"[WARN] EnsureCoreWebView2Async attempt {attempt} failed with 0x800700AA (Resource in use), retrying in 600ms...");
+                        await Task.Delay(600);
+                    }
+                }
                 App.Log("EnsureCoreWebView2Async done");
 
                 webView.CoreWebView2.Settings.IsStatusBarEnabled = false;

@@ -1,11 +1,34 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows;
 
 namespace DeepSeek
 {
     public partial class App : Application
     {
+        private static Mutex? _mutex;
+        private const string MutexName = "Local\\DeepSeek_Windows_Agent_Client_Mutex_2026";
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+        public static readonly uint WM_SHOW_DEEPSEEK = RegisterWindowMessage("DEEPSEEK_AGENT_RESTORE_WINDOW_2026");
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        private const int SW_RESTORE = 9;
+
         public static void Log(string msg)
         {
             try
@@ -33,8 +56,54 @@ namespace DeepSeek
                 args.Handled = true;
             };
 
+            bool isNewInstance;
+            try
+            {
+                _mutex = new Mutex(true, MutexName, out isNewInstance);
+            }
+            catch (Exception ex)
+            {
+                Log($"Mutex check exception: {ex.Message}");
+                isNewInstance = true;
+            }
+
+            if (!isNewInstance)
+            {
+                Log("[SingleInstance] Another instance is already running. Broadcasting wake-up message and exiting immediately.");
+                try
+                {
+                    var current = System.Diagnostics.Process.GetCurrentProcess();
+                    foreach (var proc in System.Diagnostics.Process.GetProcessesByName(current.ProcessName))
+                    {
+                        if (proc.Id != current.Id && proc.MainWindowHandle != IntPtr.Zero)
+                        {
+                            ShowWindow(proc.MainWindowHandle, SW_RESTORE);
+                            SetForegroundWindow(proc.MainWindowHandle);
+                        }
+                    }
+                }
+                catch {}
+
+                PostMessage(HWND_BROADCAST, WM_SHOW_DEEPSEEK, IntPtr.Zero, IntPtr.Zero);
+                Environment.Exit(0);
+                return;
+            }
+
             base.OnStartup(e);
-            Log("base.OnStartup done");
+            var mainWindow = new MainWindow();
+            mainWindow.Show();
+            Log("base.OnStartup done, MainWindow shown");
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            try
+            {
+                _mutex?.ReleaseMutex();
+                _mutex?.Dispose();
+            }
+            catch {}
+            base.OnExit(e);
         }
     }
 }
