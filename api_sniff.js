@@ -1,0 +1,221 @@
+// api_sniff.js — READ-ONLY network sniffer for mapping chat.deepseek.com private API.
+// Injected at document-creation (before page scripts). Wraps fetch/XHR, never alters
+// requests or responses. All records go to the native host log (local file only).
+(function() {
+    if (window.__apiSniffInstalled) return;
+    try { if (window !== window.top) return; } catch (_) {}
+    window.__apiSniffInstalled = true;
+
+    function toNative(payload) {
+        try {
+            if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+                window.chrome.webview.postMessage(payload);
+            }
+        } catch (_) {}
+    }
+
+    function shouldSkip(url) {
+        try {
+            var u = String(url);
+            if (u.indexOf('/api') >= 0) return false;
+            if (/^data:|^blob:/i.test(u)) return true;
+            var path = u.split('?')[0].toLowerCase();
+            return /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|map)(\/|$)/.test(path);
+        } catch (_) { return false; }
+    }
+
+    function summarizeBody(body, maxLen) {
+        maxLen = maxLen || 3000;
+        if (body === null || body === undefined) return { kind: 'empty' };
+        try {
+            if (typeof body === 'string') return { kind: 'string', len: body.length, preview: body.slice(0, maxLen) };
+            if (typeof FormData !== 'undefined' && body instanceof FormData) {
+                var keys = [];
+                body.forEach(function(v, k) {
+                    keys.push(k + ':' + ((typeof File !== 'undefined' && v instanceof File) ? ('File(' + v.name + ',' + v.size + ')') : typeof v));
+                });
+                return { kind: 'FormData', fields: keys };
+            }
+            if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+                var s = body.toString();
+                return { kind: 'urlencoded', len: s.length, preview: s.slice(0, maxLen) };
+            }
+            if (typeof Blob !== 'undefined' && body instanceof Blob) return { kind: 'Blob', type: body.type, size: body.size };
+            if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) return { kind: 'ArrayBuffer', bytes: body.byteLength };
+            if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(body)) return { kind: 'TypedArray', cname: body.constructor.name, bytes: body.byteLength };
+            if (typeof Request !== 'undefined' && body instanceof Request) return { kind: 'Request', url: body.url, method: body.method };
+            return { kind: typeof body, cname: body && body.constructor && body.constructor.name };
+        } catch (e) { return { kind: 'unreadable', error: String(e).slice(0, 120) }; }
+    }
+
+    function redactHeaders(h) {
+        try {
+            var out = {};
+            var pairs = [];
+            if (typeof Headers !== 'undefined' && h instanceof Headers) { h.forEach(function(v, k) { pairs.push([k, v]); }); }
+            else if (Array.isArray(h)) { pairs = h; }
+            else if (h && typeof h === 'object') { for (var k in h) { if (Object.prototype.hasOwnProperty.call(h, k)) pairs.push([k, h[k]]); } }
+            else { return {}; }
+            pairs.forEach(function(p) {
+                var k = String(p[0]); var v = String(p[1]);
+                if (/auth|token|cookie|key|secret|session/i.test(k)) out[k] = '<present:' + v.length + 'chars>';
+                else out[k] = v.length > 200 ? v.slice(0, 200) + '...' : v;
+            });
+            return out;
+        } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }
+
+    function emit(rec) {
+        rec.action = 'apisniff';
+        rec.t = Date.now();
+        toNative(rec);
+    }
+
+    // --- upload flight tracking (consumed by agent_bridge readiness check) ---
+    // Counts in-flight POSTs to the file-upload endpoint so the bridge can tell
+    // "upload finished" at the network layer instead of guessing DOM classes.
+    window.__uploadState = { pending: 0, lastReqAt: 0, lastResAt: 0 };
+    // Timestamp of the last chat-completion POST: the bridge uses it as
+    // "previous send has left" to serialize feedback sends.
+    window.__lastCompletionAt = 0;
+    function isUploadUrl(u) {
+        try { return /\/api\/v0\/file\/upload_file/.test(String(u || '')); } catch (_) { return false; }
+    }
+    function isCompletionUrl(u) {
+        try { return /\/api\/v0\/chat\/completion/.test(String(u || '')); } catch (_) { return false; }
+    }
+    function isPowUrl(u) {
+        try { return /\/api\/v0\/chat\/create_pow_challenge/.test(String(u || '')); } catch (_) { return false; }
+    }
+    function isInterestingUrl(u) {
+        try { return /\/api\/v0\/(chat\/completion|chat\/create_pow_challenge|file\/upload_file|file\/fetch_files)/.test(String(u || '')); } catch (_) { return false; }
+    }
+    function headerNamesOf(h) {
+        var names = [];
+        try {
+            if (typeof Headers !== 'undefined' && h instanceof Headers) { h.forEach(function(v, k) { names.push(k); }); }
+            else if (Array.isArray(h)) { h.forEach(function(p) { names.push(String(p[0])); }); }
+            else if (h && typeof h === 'object') { for (var k in h) { if (Object.prototype.hasOwnProperty.call(h, k)) names.push(k); } }
+        } catch (_) {}
+        return names;
+    }
+    function uploadReq(url) {
+        if (!isUploadUrl(url)) return;
+        try {
+            window.__uploadState.pending++;
+            window.__uploadState.lastReqAt = Date.now();
+        } catch (_) {}
+    }
+    function uploadRes(url) {
+        if (!isUploadUrl(url)) return;
+        try {
+            if (window.__uploadState.pending > 0) window.__uploadState.pending--;
+            window.__uploadState.lastResAt = Date.now();
+        } catch (_) {}
+    }
+
+    // --- fetch ---
+    try {
+        var origFetch = window.fetch.bind(window);
+        window.fetch = function(input, init) {
+            var url = '';
+            var method = 'GET';
+            var skipped = false;
+            try {
+                url = (typeof input === 'string') ? input : (input && input.url) || String(input);
+                method = (((init && init.method) || (input && input.method)) || 'GET').toUpperCase();
+                skipped = shouldSkip(url);
+                if (isUploadUrl(url) && method === 'POST') uploadReq(url);
+                if (isCompletionUrl(url) && method === 'POST') {
+                    try { window.__lastCompletionAt = Date.now(); } catch (_) {}
+                }
+                if (!skipped) {
+                    var body = (init && Object.prototype.hasOwnProperty.call(init, 'body')) ? init.body : undefined;
+                    var rec = { side: 'fetch-req', method: method, url: String(url).slice(0, 500),
+                           headers: redactHeaders((init && init.headers) || (input && input.headers)),
+                           body: summarizeBody(body) };
+                    if (isInterestingUrl(url)) {
+                        rec.headerNames = headerNamesOf((init && init.headers) || (input && input.headers));
+                    }
+                    emit(rec);
+                }
+            } catch (_) {}
+            return origFetch.apply(null, arguments).then(function(res) {
+                uploadRes(res.url);
+                if (isPowUrl(res.url)) {
+                    // Small JSON challenge — safe to buffer for backchannel design.
+                    try {
+                        res.clone().text().then(function(t) {
+                            emit({ side: 'pow-res', url: String(res.url).slice(0, 300), status: res.status, resBody: String(t).slice(0, 2000) });
+                        }).catch(function() {});
+                    } catch (_) {}
+                }
+                if (!skipped) {
+                    try {
+                        var ct = '';
+                        try { ct = res.headers.get('content-type') || ''; } catch (_) {}
+                        emit({ side: 'fetch-res', url: String(res.url).slice(0, 500), status: res.status, contentType: ct });
+                    } catch (_) {}
+                }
+                return res;
+            }, function(err) {
+                try { uploadRes(url); } catch (_) {}
+                throw err;
+            });
+        };
+    } catch (_) {}
+
+    // --- XHR ---
+    try {
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
+        var origSetRH = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
+            try { (this.__sniffHeaders = this.__sniffHeaders || []).push(String(k)); } catch (_) {}
+            return origSetRH.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.open = function(method, url) {
+            try { this.__sniffMethod = method; this.__sniffUrl = url; } catch (_) {}
+            return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+            var skipped = false;
+            try {
+                skipped = shouldSkip(this.__sniffUrl || '');
+                if (String(this.__sniffMethod || '').toUpperCase() === 'POST') {
+                    uploadReq(this.__sniffUrl || '');
+                    if (isCompletionUrl(this.__sniffUrl || '')) {
+                        try { window.__lastCompletionAt = Date.now(); } catch (_) {}
+                    }
+                }
+                var self = this;
+                var finish = function(emitRes) {
+                    try { uploadRes(self.__sniffUrl || ''); } catch (_) {}
+                    if (!emitRes) return;
+                    try {
+                        var rec = { side: 'xhr-res', url: String(self.__sniffUrl || '').slice(0, 500), status: self.status };
+                        if (isPowUrl(self.__sniffUrl || '')) {
+                            try { rec.resBody = String(self.responseText || '').slice(0, 2000); } catch (_) {}
+                        }
+                        emit(rec);
+                    } catch (_) {}
+                };
+                if (!skipped) {
+                    var reqRec = { side: 'xhr-req', method: String(this.__sniffMethod || ''), url: String(this.__sniffUrl || '').slice(0, 500), body: summarizeBody(body) };
+                    if (isInterestingUrl(this.__sniffUrl || '')) {
+                        reqRec.headerNames = self.__sniffHeaders || [];
+                    }
+                    emit(reqRec);
+                    this.addEventListener('load', function() { finish(true); });
+                    this.addEventListener('error', function() { finish(true); });
+                    this.addEventListener('abort', function() { finish(true); });
+                } else {
+                    this.addEventListener('load', function() { finish(false); });
+                    this.addEventListener('error', function() { finish(false); });
+                    this.addEventListener('abort', function() { finish(false); });
+                }
+            } catch (_) {}
+            return origSend.apply(this, arguments);
+        };
+    } catch (_) {}
+})();

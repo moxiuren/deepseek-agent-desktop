@@ -14,3 +14,7 @@ windows/publish/
 *.user
 *.suo
 
+# Trial/installer binaries (shipped as GitHub Release assets, not in tree)
+dist/*.exe
+dist/*.zip
+

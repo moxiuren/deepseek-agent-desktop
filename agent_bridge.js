@@ -58,11 +58,14 @@
 ${cmdGuide}
 
 【执行协议】：
-当你需要让本地模型编写或修改代码时，请使用以下格式输出命令（agy-run 已默认配置为 3.8 Flash Low）：
+当你需要让本地模型编写或修改代码时，直接输出以下格式（agy 已在 PATH，无需写路径）：
 \`\`\`local_cmd
-agy-run "请根据以下完整要求生成代码：<你的详细完整指令>"
+agy -p "请根据以下完整要求生成代码：<你的详细完整指令>" --model gemini-3.8-flash-low --effort low --dangerously-skip-permissions
 \`\`\`
-（或完整参数：\`agy --model gemini-3.8-flash-low -p "指令"\`）
+- \`-p\` = 非交互单次执行并打印结果（必须带，否则进入交互卡死直到超时）；
+- \`--dangerously-skip-permissions\` = 自动放行工具权限（必须带，否则停住等确认直到超时）；
+- 操作 Documents\\Projects 以外目录时追加 \`--add-dir "目标目录"\`；
+- 禁止事项：不要用 \`agy-run\`（不存在）；不要裸打 \`agy models\`（那只是查模型列表）；不要省略 -p。
 
 当你需要查看文件、探索目录或执行系统脚本时，直接输出命令：
 \`\`\`local_cmd
@@ -102,6 +105,39 @@ agent-attach 文件路径 "说明或提示"
 
     let autoExecute = true;
     let isExecutingNow = false;
+    // Last dispatch signature for duplicate merging.
+    let lastDispatch = { cmd: '', at: 0 };
+    // Serializes feedback sends: each feedback fills+clicks only after the
+    // previous send is confirmed (its completion request left) — never assume
+    // a click worked, or stale text sits in the box with no retry.
+    let feedbackChain = Promise.resolve();
+    let prevSendAt = 0;
+    let prevAcked = true;
+    function queueFeedbackSlot(fn) {
+        feedbackChain = feedbackChain.then(() => new Promise(resolve => {
+            const start = Date.now();
+            const iv = setInterval(() => {
+                let proceed = false;
+                try {
+                    const lastAck = window.__lastCompletionAt || 0;
+                    if (prevAcked) proceed = true;
+                    else if (prevSendAt > 0 && lastAck >= prevSendAt) proceed = true;
+                    else if (Date.now() - start > 8000) proceed = true;
+                } catch (_) { proceed = true; }
+                if (proceed) {
+                    clearInterval(iv);
+                    prevSendAt = Date.now();
+                    prevAcked = false;
+                    try { window.__lastSendAt = prevSendAt; } catch (_) {}
+                    try { fn((acked) => { prevAcked = !!acked; resolve(); }); }
+                    catch (_) { prevAcked = true; resolve(); }
+                }
+            }, 200);
+        }));
+        return feedbackChain;
+    }
+    // Timestamp (ms) of the last successful injectFileToChat, for upload correlation.
+    let __attachInjectedAt = 0;
     let cardControllers = {};
     let blockWatchMap = new Map();
     let pendingFeedbackTimer = null;
@@ -484,10 +520,33 @@ agent-attach 文件路径 "说明或提示"
             },
             setOutput: (output, isError) => {
                 const out = document.getElementById(`${cardId}-output-box`);
-                if (out) {
-                    out.style.color = isError ? "#f87171" : "#34d399";
-                    out.textContent = output;
-                }
+                if (!out) return;
+                out.style.color = isError ? "#f87171" : "#34d399";
+                out.textContent = output;
+                // Long outputs start folded (toggle to expand) so the page
+                // isn't a wall of terminal text; model still gets full text.
+                try {
+                    let tog = document.getElementById(`${cardId}-output-toggle`);
+                    if (output && output.length > 600) {
+                        out.style.display = 'none';
+                        if (!tog) {
+                            tog = document.createElement('button');
+                            tog.id = `${cardId}-output-toggle`;
+                            tog.style.cssText = 'background:#0f172a;color:#7dd3fc;border:1px solid #1e3a5f;border-radius:6px;padding:2px 10px;font-size:11px;cursor:pointer;margin:6px 14px;font-family:inherit;';
+                            tog.onclick = () => {
+                                const hidden = out.style.display === 'none';
+                                out.style.display = hidden ? '' : 'none';
+                                tog.textContent = hidden ? '收起输出' : `展开输出 (${output.length} 字符)`;
+                            };
+                            out.parentNode.insertBefore(tog, out);
+                        }
+                        tog.style.display = '';
+                        tog.textContent = `展开输出 (${output.length} 字符)`;
+                    } else if (tog) {
+                        tog.style.display = 'none';
+                        out.style.display = '';
+                    }
+                } catch (_) {}
             },
             showPacing: (seconds, onSendNow) => {
                 const bar = document.getElementById(`${cardId}-pacing-bar`);
@@ -616,6 +675,21 @@ agent-attach 文件路径 "说明或提示"
     function executeCommand(command, controller) {
         if (isExecutingNow) return;
 
+        // Dispatch dedup: streaming re-renders can surface the same block twice
+        // (observed 62ms apart) — two feedback flows then stomp the composer and
+        // the site fails the send. Merge identical commands within 5s.
+        // Normalized: re-renders may differ in whitespace only.
+        const nowMs = Date.now();
+        const normCmd = String(command).replace(/\s+/g, ' ').trim();
+        try { diagAttach({ phase: 'dispatch', cmd: normCmd.slice(0, 80) }); } catch (_) {}
+        if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
+            controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
+            controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
+            try { console.log('[Agent Bridge] Duplicate dispatch merged: ' + String(command).slice(0, 80)); } catch (_) {}
+            return;
+        }
+        lastDispatch = { cmd: normCmd, at: nowMs };
+
         isExecutingNow = true;
         controller.hidePacing();
         controller.setStatus("正在执行本地命令...", "#d97706", true);
@@ -634,6 +708,15 @@ agent-attach 文件路径 "说明或提示"
     // 4b. Direct File Write via Native Host
     function executeFileWrite(path, content, controller) {
         if (isExecutingNow) return;
+
+        const nowMs = Date.now();
+        const sig = 'write_file:' + String(path || '').trim();
+        if (sig === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
+            controller.setStatus('重复写入已合并（5s内相同目标）', '#8b5cf6', false);
+            controller.setOutput('相同目标文件的写入在短时间内重复下发，已自动合并。');
+            return;
+        }
+        lastDispatch = { cmd: sig, at: nowMs };
 
         isExecutingNow = true;
         controller.hidePacing();
@@ -731,11 +814,22 @@ agent-attach 文件路径 "说明或提示"
 
                     container.appendChild(pill);
                     container.appendChild(contentWrapper);
+                    try { window.__collapsedBubbles = (window.__collapsedBubbles || 0) + 1; } catch (_) {}
                     break;
                 }
                 container = container.parentElement;
             }
         }
+    }
+
+    // Rapid re-scan burst right after we click send: catches the feedback bubble
+    // the moment React renders it instead of waiting for the 600ms loop.
+    function burstCollapse() {
+        let n = 0;
+        const iv = setInterval(() => {
+            try { collapseToolFeedbackBubbles(); } catch (_) {}
+            if (++n >= 12) { try { clearInterval(iv); } catch (_) {} }
+        }, 250);
     }
 
     // Helper: Convert Base64 string to a synthetic File object
@@ -784,16 +878,143 @@ agent-attach 文件路径 "说明或提示"
         }
     }
 
-    // Helper: Wait until DeepSeek web finishes uploading attachment to server
-    function waitForAttachmentReady(callback, maxWaitMs = 12000) {
+    // Probe each readiness signal separately (also feeds attachdiag logging).
+    function probeAttachmentState() {
+        const ta = findInputTextarea();
+        const root = (ta && ta.closest('form')) || document;
+        const st = { scoped: !!ta, loading: 0, chip: false, btnFound: false, btnDisabled: true, chipDesc: '' };
+        // Positive first: attachment chip actually present in composer?
+        let chip = null;
+        try {
+            chip = root.querySelector(
+                'img[src^="blob:"], [class*="preview"], [class*="Preview"], ' +
+                '[class*="attach"], [class*="Attach"], [class*="thumb"], [class*="Thumb"]');
+        } catch (_) {}
+        if (chip) {
+            st.chip = true;
+            try {
+                st.chipDesc = '<' + chip.tagName + ' class="' + String(chip.className).slice(0, 80) + '">';
+                const cp = chip.parentElement;
+                st.chipParent = cp ? ('<' + cp.tagName + ' class="' + String(cp.className).slice(0, 60) + '">') : '';
+            } catch (_) {}
+        }
+        // Negative: still uploading? (visible loading/spinner that is NOT the chip's own stale wrapper)
+        let loading = [];
+        try {
+            loading = root.querySelectorAll(
+                '.ds-animated-size-item .ds-loading, .ds-animated-size-item [class*="loading"], ' +
+                '[class*="Loading"], [class*="spin"], [class*="Spin"], ' +
+                '[class*="uploading"], [class*="Uploading"]');
+        } catch (_) {}
+        for (const el of loading) {
+            try {
+                // (a) Ignore our own overlay UI (HUD / tool cards / collapsed pills)
+                if (el.closest && el.closest('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill')) continue;
+                // (b) Ignore hidden elements (rect alone doesn't reflect visibility)
+                let cs = null;
+                try { cs = getComputedStyle(el); } catch (_) {}
+                if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0')) continue;
+                // (c) Ignore a stale wrapper around the already-rendered chip:
+                // the site leaves ds-loading on the thumbnail container after upload 200.
+                if (chip && (el.contains(chip) || (chip.contains && chip.contains(el)))) continue;
+                // (d) Ignore a stale spinner sitting in the SAME thumbnail box as the chip
+                // (observed: div.ds-loading sibling of the IMG under the same hashed container,
+                // still in DOM long after upload returned 200).
+                try {
+                    const chipBox = chip && chip.parentElement;
+                    if (chipBox && (chipBox === el || chipBox.contains(el))) continue;
+                } catch (_) {}
+            } catch (_) {}
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                st.loading++;
+                if (st.loading <= 2) {
+                    try {
+                        const p = el.parentElement;
+                        st.loadingDesc = (st.loadingDesc || '') + '<' + el.tagName + ' class="' + String(el.className).slice(0, 60) +
+                            '" parent=<' + (p ? p.tagName : '?') + ' class="' + (p ? String(p.className).slice(0, 60) : '') + '">;';
+                    } catch (_) {}
+                }
+            }
+        }
+        // Send control must be enabled (guards React async state right after onChange)
+        const btn = findSendButton();
+        if (btn) {
+            st.btnFound = true;
+            st.btnDisabled = isControlDisabled(btn);
+        }
+        // Network-layer upload gate (from api_sniff flight counter): the DOM
+        // ds-loading div proved to be a stale leftover, so it no longer gates.
+        // Ready = chip rendered + send enabled + no upload in flight +
+        // (upload observed since our inject, or 2s grace so an instant
+        // send can't slip through before the upload request even starts).
+        let upPending = 0, upLastReq = 0;
+        try {
+            if (window.__uploadState) {
+                upPending = window.__uploadState.pending | 0;
+                upLastReq = window.__uploadState.lastReqAt || 0;
+            }
+        } catch (_) {}
+        st.pending = upPending;
+        st.uploadSeen = upLastReq > __attachInjectedAt && __attachInjectedAt > 0;
+        const settling = Date.now() - (__attachInjectedAt || Date.now());
+        // NOTE: send-button state no longer gates here on purpose — the fill
+        // happens AFTER the wait, so the box stays empty (invisible process)
+        // until the last moment; enabled-poll runs right before the click.
+        st.ready = (st.chip && st.pending === 0 &&
+                    (st.uploadSeen || settling > 2000));
+        return st;
+    }
+
+    function isAttachmentReady() {
+        return probeAttachmentState().ready;
+    }
+
+    function diagAttach(labels) {
+        try {
+            const payload = Object.assign({ action: 'attachdiag', t: Date.now() }, labels);
+            sendToNative(payload);
+        } catch (_) {}
+    }
+
+    // Helper: Wait until DeepSeek web finishes uploading attachment to server.
+    // Fires ASAP once triple-signal holds (with 800ms dwell covering the upload tail),
+    // 8s timeout fallback still sends to never wedge the loop.
+    function waitForAttachmentReady(callback, maxWaitMs = 8000) {
         const startTime = Date.now();
+        let readySince = 0;
+        let ticks = 0;
         const timer = setInterval(() => {
-            const loadingEls = document.querySelectorAll('.ds-animated-size-item .ds-loading, .ds-animated-size-item [class*="loading"]');
-            if (loadingEls.length === 0 || (Date.now() - startTime > maxWaitMs)) {
+            const now = Date.now();
+            ticks++;
+            const st = probeAttachmentState();
+            // Log signal states ~1/sec for diagnosis (native writes to local log)
+            if (ticks % 7 === 1) {
+                diagAttach({ phase: 'wait', elapsed: now - startTime, loading: st.loading,
+                             chip: st.chip, btnFound: st.btnFound, btnDisabled: st.btnDisabled,
+                             pending: st.pending, uploadSeen: !!st.uploadSeen });
+            }
+            if (st.ready) {
+                if (!readySince) readySince = now;
+                if (now - readySince >= 800 || now - startTime > maxWaitMs) {
+                    clearInterval(timer);
+                    let collapsed = 0;
+                    try { collapsed = window.__collapsedBubbles || 0; } catch (_) {}
+                    diagAttach({ phase: 'fire', elapsed: now - startTime, dwell: now - readySince, collapsed: collapsed });
+                    callback();
+                }
+                return;
+            }
+            readySince = 0;
+            if (now - startTime > maxWaitMs) {
                 clearInterval(timer);
+                diagAttach({ phase: 'timeout', elapsed: now - startTime, loading: st.loading,
+                             chip: st.chip, btnFound: st.btnFound, btnDisabled: st.btnDisabled,
+                             pending: st.pending, uploadSeen: !!st.uploadSeen });
+                try { console.warn("[Agent Bridge] Attachment wait timed out, sending anyway"); } catch (_) {}
                 callback();
             }
-        }, 300);
+        }, 150);
     }
 
     // 6. Handle Native Result + Polite Pacing
@@ -842,7 +1063,11 @@ agent-attach 文件路径 "说明或提示"
             if (isAttachment && data.base64Data) {
                 try {
                     fileObj = base64ToFile(data.base64Data, data.filename || "attachment.txt", data.mimeType || "text/plain");
-                    injectFileToChat(fileObj);
+                    if (injectFileToChat(fileObj)) { __attachInjectedAt = Date.now(); }
+                    else {
+                        fileObj = null;
+                        try { diagAttach({ phase: 'inject-failed', name: data.filename || '' }); } catch (_) {}
+                    }
                 } catch(e) {
                     console.error("[Agent Bridge] Failed to process attachment:", e);
                 }
@@ -886,9 +1111,19 @@ ${output}
 ${output}
 \`\`\`
 请根据上述终端执行结果继续。若需继续执行命令请输出 \`\`\`local_cmd 代码块，若全部完成请给出最终解答。`;
+                if (isAttachment && !fileObj) {
+                    feedback += `\n(注：本轮附件未能挂载到输入框，已转纯文本反馈，不影响继续。)`;
+                }
             }
 
-            let countdown = isAttachment ? 4 : 3;
+            // Text-only fallback used when the attachment never materialized.
+            const fallbackFeedback = () => `[Tool Call Result (Exit: ${exitCode})]:
+\`\`\`
+${output}
+\`\`\`
+(注：附件未能挂载显示，已转纯文本反馈，请继续。若需继续执行请输出 \`\`\`local_cmd 代码块，若完成请直接解答。)`;
+
+            let countdown = (isAttachment && fileObj) ? 1 : 3;
             if (controller) {
                 controller.showPacing(countdown, () => {
                     if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
@@ -898,24 +1133,69 @@ ${output}
 
             function sendFeedbackNow() {
                 if (controller) controller.hidePacing();
-                const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
-                updateHUD(hudMsg, "#2563eb");
-                
-                if (isAttachment) {
-                    waitForAttachmentReady(() => {
+                // Serialize on the send slot: fill+click only after the previous
+                // send's completion request has left (or fallback timeout).
+                queueFeedbackSlot((release) => {
+                    const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
+                    updateHUD(hudMsg, "#2563eb");
+
+                    if (isAttachment && fileObj) {
+                        // Wait with the box EMPTY (nothing visible), then fill and
+                        // click within ~300ms: the text only flashes, never sits.
+                        waitForAttachmentReady((rushed) => {
+                            if (rushed) {
+                                injectPrompt(fallbackFeedback(), true);
+                                verifySentOrRetry((ok) => {
+                                    release(!!ok);
+                                    burstCollapse();
+                                    setTimeout(() => {
+                                        updateHUD("Tool Call 引擎就绪", "#10b981");
+                                        collapseToolFeedbackBubbles();
+                                    }, 1500);
+                                });
+                                return;
+                            }
+                            injectPrompt(feedback, false);
+                            try {
+                                const ta = findInputTextarea();
+                                diagAttach({ phase: 'filled', taFound: !!ta, taLen: (ta && (ta.value || '').length) || 0 });
+                            } catch (_) {}
+                            let tries = 0;
+                            const clickIv = setInterval(() => {
+                                tries++;
+                                let ok = false;
+                                try {
+                                    const b = findSendButton();
+                                    if (b && !isControlDisabled(b)) ok = true;
+                                } catch (_) {}
+                                if (ok || tries >= 15) {
+                                    try { clearInterval(clickIv); } catch (_) {}
+                                    triggerSend();
+                                    verifySentOrRetry((ok2) => {
+                                        release(!!ok2);
+                                        burstCollapse();
+                                        setTimeout(() => {
+                                            updateHUD("Tool Call 引擎就绪", "#10b981");
+                                            collapseToolFeedbackBubbles();
+                                        }, 1500);
+                                    });
+                                }
+                            }, 100);
+                        });
+                    } else {
                         injectPrompt(feedback, true);
+                        burstCollapse();
+                        // Slot covers injectPrompt's internal 500ms delayed click;
+                        // verify the send actually left instead of assuming.
+                        setTimeout(() => {
+                            verifySentOrRetry((ok) => { release(!!ok); });
+                        }, 700);
                         setTimeout(() => {
                             updateHUD("Tool Call 引擎就绪", "#10b981");
                             collapseToolFeedbackBubbles();
                         }, 1500);
-                    });
-                } else {
-                    injectPrompt(feedback, true);
-                    setTimeout(() => {
-                        updateHUD("Tool Call 引擎就绪", "#10b981");
-                        collapseToolFeedbackBubbles();
-                    }, 1500);
-                }
+                    }
+                });
             }
 
             pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
@@ -1012,6 +1292,44 @@ ${output}
         });
         textarea.dispatchEvent(enterEv);
         return true;
+    }
+
+    // Verify the click actually sent (a completion request left the page);
+    // if our text is still sitting in the box, click again (max ~6s).
+    // Without this, a swallowed click leaves text "stuck" with no retry.
+    function verifySentOrRetry(done) {
+        let ack0 = 0;
+        try { ack0 = window.__lastCompletionAt || 0; } catch (_) {}
+        const t0 = Date.now();
+        let clicks = 0;
+        let tick = 0;
+        const iv = setInterval(() => {
+            tick++;
+            let cur = 0;
+            try { cur = window.__lastCompletionAt || 0; } catch (_) {}
+            let ours = false;
+            try {
+                const ta = findInputTextarea();
+                let v = '';
+                if (ta) v = (ta.value !== undefined ? ta.value : ta.innerText) || '';
+                ours = !!(v && v.indexOf('[Tool Call') === 0);
+            } catch (_) {}
+            if (cur > ack0 || !ours) {
+                try { clearInterval(iv); } catch (_) {}
+                diagAttach({ phase: 'sent-ack', elapsed: Date.now() - t0, clicks: clicks });
+                try { done(true); } catch (_) {}
+                return;
+            }
+            if (Date.now() - t0 > 6000) {
+                try { clearInterval(iv); } catch (_) {}
+                diagAttach({ phase: 'sent-giveup', elapsed: Date.now() - t0, clicks: clicks });
+                try { done(false); } catch (_) {}
+                return;
+            }
+            if (tick % 4 === 0) {
+                try { triggerSend(); clicks++; } catch (_) {}
+            }
+        }, 200);
     }
 
     function injectPrompt(text, autoSend = false) {

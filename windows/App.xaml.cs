@@ -29,11 +29,42 @@ namespace DeepSeek
 
         private const int SW_RESTORE = 9;
 
+        // Diagnostics (sniffer + verbose desktop log) are OFF by default for
+        // distributed builds. Enable on a dev machine by either:
+        //   set DEEPSEEK_DIAG=1   (environment variable), or
+        //   create empty file %LOCALAPPDATA%\DeepSeek-Agent\diag.enable
+        public static readonly bool DiagnosticsEnabled = CheckDiagnostics();
+
+        private static bool CheckDiagnostics()
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable("DEEPSEEK_DIAG") == "1") return true;
+                string flag = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DeepSeek-Agent", "diag.enable");
+                if (File.Exists(flag)) return true;
+            }
+            catch {}
+            return false;
+        }
+
         public static void Log(string msg)
         {
             try
             {
-                string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "deepseek_debug.log");
+                string logPath;
+                if (DiagnosticsEnabled)
+                {
+                    logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "deepseek_debug.log");
+                }
+                else
+                {
+                    logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "DeepSeek-Agent", "logs", "deepseek.log");
+                    string? dir = Path.GetDirectoryName(logPath);
+                    if (dir != null) Directory.CreateDirectory(dir);
+                }
                 File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}\r\n");
             }
             catch {}

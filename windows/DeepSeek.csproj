@@ -12,11 +12,16 @@
     <Authors>moxiuren</Authors>
     <Product>DeepSeek for Windows</Product>
     <Description>Native Windows desktop client for DeepSeek with autonomous local Agent closed-loop execution</Description>
+    <!-- 必须多文件发布：Microsoft.PowerShell.SDK 的 InitialSessionState.CreateDefault()
+         依赖 Assembly.Location 定位模块目录，单文件发布下 Location 为空导致
+         "Value cannot be null. (Parameter 'path1')"，所有命令退出码 -1 -->
+    <PublishSingleFile>false</PublishSingleFile>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
     <PackageReference Include="System.Drawing.Common" Version="10.0.12" />
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.*" />
   </ItemGroup>
 
   <!-- Embed and copy the shared agent_bridge.js from root -->
@@ -25,6 +30,9 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <EmbeddedResource Include="..\agent_bridge.js" Link="Resources\agent_bridge.js" />
+    <None Include="..\api_sniff.js" Link="api_sniff.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,10 @@
 using System;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +21,56 @@ namespace DeepSeek
     {
         private bool _isExecuting = false;
         private long _lastDropTimestamp = 0;
+
+        // Persistent runspace: kills per-command powershell.exe spawn (~200-500ms each).
+        // Session persists across commands (cwd, variables, $env:), commands stay serialized via _isExecuting.
+        private Runspace? _runspace;
+        private readonly object _poolLock = new();
+
+        private Runspace GetRunspace()
+        {
+            lock (_poolLock)
+            {
+                if (_runspace != null &&
+                    _runspace.RunspaceStateInfo.State != RunspaceState.Opened)
+                {
+                    try { _runspace.Dispose(); } catch {}
+                    _runspace = null;
+                }
+                if (_runspace != null) return _runspace;
+
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
+                string workingDir = Directory.Exists(projectsDir) ? projectsDir : userProfile;
+                string localBin = Path.Combine(userProfile, ".local", "bin");
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string programsBin = Path.Combine(appData, "Programs");
+
+                var iss = InitialSessionState.CreateDefault();
+                iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+                var rs = RunspaceFactory.CreateRunspace(iss);
+                rs.Open();
+
+                // One-time session setup (persists for all later commands)
+                try
+                {
+                    using var init = System.Management.Automation.PowerShell.Create();
+                    init.Runspace = rs;
+                    Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
+                    init.AddScript($"Set-Location -LiteralPath {q(workingDir)}; $env:PATH = {q(localBin)} + ';' + {q(programsBin)} + ';' + $env:PATH");
+                    init.Invoke();
+                    init.Streams.ClearStreams();
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[Runspace] init script warning: {ex.Message}");
+                }
+
+                App.Log($"[Runspace] persistent runspace opened (cwd={workingDir})");
+                _runspace = rs;
+                return rs;
+            }
+        }
 
         public MainWindow()
         {
@@ -66,6 +120,10 @@ namespace DeepSeek
             ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
 
             Loaded += MainWindow_Loaded;
+            Closed += (s, e) =>
+            {
+                try { lock (_poolLock) { _runspace?.Dispose(); _runspace = null; } } catch {}
+            };
             App.Log("MainWindow.ctor exit");
         }
 
@@ -190,6 +248,26 @@ namespace DeepSeek
                 // Handle messages sent from agent_bridge.js
                 webView.CoreWebView2.WebMessageReceived += CoreWebView2_WebMessageReceived;
 
+                // Inject api_sniff.js FIRST (read-only fetch/XHR sniffer, must wrap before page scripts run)
+                // Dev-only: skipped entirely unless diagnostics are enabled (env/file flag, see App).
+                if (App.DiagnosticsEnabled)
+                {
+                    string sniffScript = GetApiSniffScript();
+                    if (!string.IsNullOrEmpty(sniffScript))
+                    {
+                        await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(sniffScript);
+                        App.Log($"api_sniff.js script registered ({sniffScript.Length} chars)");
+                    }
+                    else
+                    {
+                        App.Log("[WARN] api_sniff.js not found, sniffer disabled");
+                    }
+                }
+                else
+                {
+                    App.Log("api_sniff skipped (diagnostics off)");
+                }
+
                 // Inject agent_bridge.js on document created (guarantees execution on all page loads)
                 string bridgeScript = GetAgentBridgeScript();
                 if (!string.IsNullOrEmpty(bridgeScript))
@@ -250,6 +328,27 @@ namespace DeepSeek
             return "";
         }
 
+        private string GetApiSniffScript()
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // 1. Try file in the same directory as executable
+            string localPath = Path.Combine(baseDir, "api_sniff.js");
+            if (File.Exists(localPath))
+            {
+                try { return File.ReadAllText(localPath, Encoding.UTF8); } catch {}
+            }
+
+            // 2. Try repo root (development mode)
+            string parentPath = Path.Combine(baseDir, "..", "..", "..", "..", "api_sniff.js");
+            if (File.Exists(parentPath))
+            {
+                try { return File.ReadAllText(parentPath, Encoding.UTF8); } catch {}
+            }
+
+            return "";
+        }
+
         private void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
             try
@@ -266,6 +365,43 @@ namespace DeepSeek
                 {
                     string msg = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() ?? "" : "";
                     Trace.WriteLine($"[Agent JS Log] {msg}");
+                }
+                else if (action == "attachdiag")
+                {
+                    // Attachment-readiness signal diagnostics (dev only, dropped in trial builds)
+                    if (!App.DiagnosticsEnabled) return;
+                    // Attachment-readiness signal diagnostics (local log only)
+                    var parts = new System.Collections.Generic.List<string>();
+                    foreach (var prop in root.EnumerateObject())
+                    {
+                        if (prop.Name == "action") continue;
+                        parts.Add($"{prop.Name}={prop.Value}");
+                    }
+                    App.Log($"[ATTACHDIAG] {string.Join(" ", parts)}");
+                }
+                else if (action == "apisniff")
+                {
+                    // Read-only network sniffer records (local log only, never leaves the machine)
+                    string side = root.TryGetProperty("side", out var s) ? s.GetString() ?? "" : "";
+                    string method = root.TryGetProperty("method", out var m) ? m.GetString() ?? "" : "";
+                    string url = root.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+                    string status = root.TryGetProperty("status", out var st) ? st.ToString() : "";
+                    string ct = root.TryGetProperty("contentType", out var c) ? c.GetString() ?? "" : "";
+                    string bodyKind = "", bodyPrev = "";
+                    if (root.TryGetProperty("body", out var b) && b.ValueKind == JsonValueKind.Object)
+                    {
+                        if (b.TryGetProperty("kind", out var k)) bodyKind = k.GetString() ?? "";
+                        if (b.TryGetProperty("preview", out var p)) bodyPrev = (p.GetString() ?? "").Replace("\r", " ").Replace("\n", " ");
+                        else if (b.TryGetProperty("fields", out var f)) bodyPrev = string.Join(",", f.EnumerateArray().Select(x => x.GetString()));
+                        else if (b.TryGetProperty("len", out var l)) bodyPrev = $"len={l}";
+                    }
+                    if (bodyPrev.Length > 1500) bodyPrev = bodyPrev.Substring(0, 1500) + "...[truncated]";
+                    string hnames = "";
+                    if (root.TryGetProperty("headerNames", out var h) && h.ValueKind == JsonValueKind.Array)
+                        hnames = string.Join(",", h.EnumerateArray().Select(x => x.GetString()));
+                    string resBody = root.TryGetProperty("resBody", out var rb) ? ((rb.GetString() ?? "").Replace("\r", " ").Replace("\n", " ")) : "";
+                    if (resBody.Length > 2000) resBody = resBody.Substring(0, 2000) + "...[truncated]";
+                    App.Log($"[APISNIFF] {side} {method} {url} status={status} ct={ct} bodyKind={bodyKind} {bodyPrev} hnames=[{hnames}] resBody={resBody}");
                 }
                 else if (action == "execute")
                 {
@@ -546,54 +682,6 @@ namespace DeepSeek
             }
         }
 
-        /// <summary>
-        /// PowerShell serialises its error stream as CLIXML whenever stderr is redirected
-        /// (e.g. "#&lt; CLIXML &lt;Objs ...&gt;&lt;S S=\"Error\"&gt;real message&lt;/S&gt;&lt;/Objs&gt;").
-        /// That XML then leaked verbatim into the command output the planner reads, burying the
-        /// actual message. Unwrap it back to plain text. Note: $ProgressPreference suppression
-        /// (applied in the command prefix) removes the progress Obj; error records still need this.
-        /// </summary>
-        private static string CleanPowerShellStderr(string raw)
-        {
-            if (string.IsNullOrEmpty(raw)) return raw;
-            const string marker = "#< CLIXML";
-            string trimmed = raw.TrimStart();
-            if (!trimmed.StartsWith(marker, StringComparison.Ordinal)) return raw;
-            try
-            {
-                // NOTE: search for the root element AFTER the marker -- the marker itself
-                // contains a '<' ("#<"), so a naive IndexOf('<') lands on that and the parse fails.
-                int lt = raw.IndexOf("<Objs", StringComparison.Ordinal);
-                if (lt < 0) return trimmed.Substring(marker.Length).Trim();
-                var doc = new System.Xml.XmlDocument { XmlResolver = null };
-                doc.LoadXml(raw.Substring(lt));
-
-                var sb = new StringBuilder();
-                var nodes = doc.SelectNodes("//*[local-name()='S']");
-                if (nodes != null)
-                {
-                    foreach (System.Xml.XmlNode n in nodes) sb.Append(n.InnerText);
-                }
-                if (sb.Length == 0 && doc.DocumentElement != null) sb.Append(doc.DocumentElement.InnerText);
-
-                string text = sb.ToString()
-                    .Replace("_x000D_", "")
-                    .Replace("_x000A_", "\n")
-                    .Replace("_x0009_", "\t")
-                    // CLIXML escapes a literal '_' as _x005F_, so this must be undone LAST:
-                    // doing it first could synthesise a fresh _x000A_ that then decodes wrongly.
-                    .Replace("_x005F_", "_")
-                    .Replace("\r\n", "\n")
-                    .Trim();
-                return text;
-            }
-            catch
-            {
-                // Payload was not well-formed XML -- strip the marker and move on.
-                return trimmed.Substring(marker.Length).Trim();
-            }
-        }
-
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
             if (_isExecuting) return;
@@ -612,61 +700,63 @@ namespace DeepSeek
 
             try
             {
-                // Execute via powershell.exe using -EncodedCommand for 100% robust cross-platform scripting
-                // NOTE: with redirected stderr PowerShell serialises its progress stream as CLIXML
-                // (e.g. `<Objs Version="1.1.0.1" ...><Obj S="progress"`), which then leaked into the
-                // command output the planner reads. Suppress the progress stream at the source.
-                byte[] bytes = Encoding.Unicode.GetBytes("$ProgressPreference='SilentlyContinue'; " + command);
-                string base64 = Convert.ToBase64String(bytes);
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8
-                };
-
-                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
-                psi.WorkingDirectory = Directory.Exists(projectsDir) ? projectsDir : userProfile;
-
-                string localBin = Path.Combine(userProfile, ".local", "bin");
-                string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string programsBin = Path.Combine(appData, "Programs");
-                string currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
-                psi.Environment["PATH"] = $"{localBin};{programsBin};{currentPath}";
-
-                using var process = new Process { StartInfo = psi };
+                // Persistent runspace execution: no powershell.exe spawn per command.
+                // Out-String -Stream keeps console-like formatting; error stream mirrors old STDERR split.
+                var runspace = GetRunspace();
                 var outSb = new StringBuilder();
                 var errSb = new StringBuilder();
+                bool hadErrors = false;
 
-                process.OutputDataReceived += (s, e) => { if (e.Data != null) outSb.AppendLine(e.Data); };
-                process.ErrorDataReceived += (s, e) => { if (e.Data != null) errSb.AppendLine(e.Data); };
+                using var ps = System.Management.Automation.PowerShell.Create();
+                ps.Runspace = runspace;
+                ps.AddScript("$ProgressPreference='SilentlyContinue'; " + command);
+                ps.AddCommand("Out-String").AddParameter("Width", 1024).AddParameter("Stream", true);
 
-                process.Start();
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
-                try
+                Collection<PSObject>? results = null;
+                Exception? invokeEx = null;
+                var invokeTask = Task.Run(() =>
                 {
-                    await process.WaitForExitAsync(cts.Token);
-                    exitCode = process.ExitCode;
-                }
-                catch (OperationCanceledException)
+                    try { results = ps.Invoke(); }
+                    catch (Exception ex) { invokeEx = ex; }
+                });
+                var finished = await Task.WhenAny(invokeTask, Task.Delay(TimeSpan.FromSeconds(180)));
+                if (finished != invokeTask)
                 {
-                    try { process.Kill(true); } catch {}
+                    try { ps.Stop(); } catch {}
+                    try { await invokeTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch {}
                     exitCode = 124;
                     errSb.AppendLine("【命令执行超时中断 (超过 180 秒)】");
                 }
+                else
+                {
+                    await invokeTask;
+                    if (invokeEx != null)
+                    {
+                        hadErrors = true;
+                        errSb.AppendLine(invokeEx.Message);
+                    }
+                    if (results != null)
+                    {
+                        foreach (var o in results)
+                        {
+                            if (o != null) outSb.AppendLine(o.ToString());
+                        }
+                    }
+                    if (ps.HadErrors) hadErrors = true;
+                    foreach (var e in ps.Streams.Error)
+                    {
+                        hadErrors = true;
+                        string msg = e.ErrorDetails?.Message ?? e.Exception?.Message ?? e.ToString();
+                        string at = e.InvocationInfo?.Line?.Trim() ?? "";
+                        if (!string.IsNullOrEmpty(at) && !msg.Contains(at))
+                            msg += $" (at: {at})";
+                        errSb.AppendLine(msg);
+                    }
+                    exitCode = hadErrors ? 1 : 0;
+                }
 
                 string outStr = outSb.ToString();
-                string errStr = CleanPowerShellStderr(errSb.ToString());
+                string errStr = errSb.ToString();
 
                 if (!string.IsNullOrEmpty(outStr)) output += outStr;
                 if (!string.IsNullOrEmpty(errStr))
@@ -759,6 +849,7 @@ namespace DeepSeek
             {
                 exitCode = -1;
                 output = $"执行失败: {ex.Message}";
+                App.Log($"[Execute] FAILED id={id} cmd-head={command.Substring(0, Math.Min(120, command.Length))} ex={ex}");
             }
             finally
             {
@@ -883,10 +974,7 @@ namespace DeepSeek
 
         private void UpdateZoomDisplay(double factor)
         {
-            if (btnZoomFactor != null)
-            {
-                btnZoomFactor.Content = $"{Math.Round(factor * 100)}%";
-            }
+            // 纯净模式：无顶栏缩放按钮，无需更新显示（缩放仍生效并持久化）
         }
 
         private void MenuZoomIn_Click(object sender, RoutedEventArgs e)

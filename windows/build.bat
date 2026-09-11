@@ -23,8 +23,9 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [2/3] Building and publishing single-file executable...
-dotnet publish DeepSeek.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+echo [2/3] Building and publishing...
+rem NOTE: PublishSingleFile is forbidden (PowerShell SDK crashes under single-file, see csproj comment)
+dotnet publish DeepSeek.csproj -c Release -r win-x64 --self-contained false -o publish
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] dotnet publish failed.
     pause
