@@ -6,6 +6,7 @@ using System.Linq;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -21,6 +22,7 @@ namespace DeepSeek
     {
         private bool _isExecuting = false;
         private long _lastDropTimestamp = 0;
+        private long _lastInjectTicks = 0;
 
         // Persistent runspace: kills per-command powershell.exe spawn (~200-500ms each).
         // Session persists across commands (cwd, variables, $env:), commands stay serialized via _isExecuting.
@@ -119,9 +121,18 @@ namespace DeepSeek
             // Global shortcut handler that works even when WebView2 is focused
             ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
 
+            // Low-level keyboard hook: WebView2's native child window bypasses the
+            // WPF dispatcher pump, so ComponentDispatcher never sees keys pressed
+            // while the page has focus. WH_KEYBOARD_LL sees them system-wide; we
+            // only act when OUR window is foreground, everyone else unaffected.
+            _llHookProc = LowLevelKeyboardProc;
+            _llHookId = SetWindowsHookEx(WH_KEYBOARD_LL, _llHookProc, GetModuleHandle(null), 0);
+            App.Log($"LL keyboard hook installed: {_llHookId != IntPtr.Zero}");
+
             Loaded += MainWindow_Loaded;
             Closed += (s, e) =>
             {
+                try { if (_llHookId != IntPtr.Zero) { UnhookWindowsHookEx(_llHookId); _llHookId = IntPtr.Zero; } } catch {}
                 try { lock (_poolLock) { _runspace?.Dispose(); _runspace = null; } } catch {}
             };
             App.Log("MainWindow.ctor exit");
@@ -136,6 +147,58 @@ namespace DeepSeek
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint msg, uint action, IntPtr pChangeFilterStruct);
+
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN_LL = 0x0100;
+        private const int WM_SYSKEYDOWN_LL = 0x0104;
+        private const int VK_CONTROL_LL = 0x11;
+        private const int VK_I_LL = 0x49;
+
+        private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll")]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        private HookProc? _llHookProc;
+        private IntPtr _llHookId = IntPtr.Zero;
+
+        private IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN_LL || wParam == (IntPtr)WM_SYSKEYDOWN_LL))
+                {
+                    int vk = Marshal.ReadInt32(lParam);
+                    if (vk == VK_I_LL && (GetAsyncKeyState(VK_CONTROL_LL) & 0x8000) != 0)
+                    {
+                        var mine = new WindowInteropHelper(this).Handle;
+                        if (mine != IntPtr.Zero && GetForegroundWindow() == mine)
+                        {
+                            App.Log("[Hotkey] Ctrl+I intercepted (llhook)");
+                            Dispatcher.BeginInvoke(new Action(() => MenuInjectPrompt_Click(this, new RoutedEventArgs())));
+                            return (IntPtr)1;
+                        }
+                    }
+                }
+            }
+            catch {}
+            return CallNextHookEx(_llHookId, nCode, wParam, lParam);
+        }
 
         private const uint MSGFLT_ALLOW = 1;
         private const int SW_RESTORE = 9;
@@ -924,6 +987,15 @@ namespace DeepSeek
 
         private async void MenuInjectPrompt_Click(object sender, RoutedEventArgs e)
         {
+            // Debounce: llhook + dispatcher hook may both fire for one press.
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (nowMs - _lastInjectTicks < 1000)
+            {
+                App.Log("[Inject] debounced (double-fire)");
+                return;
+            }
+            _lastInjectTicks = nowMs;
+            App.Log("[Inject] hotkey received");
             if (webView?.CoreWebView2 == null)
             {
                 App.Log("[Inject] CoreWebView2 is null - window not ready");
