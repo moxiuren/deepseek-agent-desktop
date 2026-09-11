@@ -16,10 +16,13 @@ namespace DeepSeek
     public partial class MainWindow : Window
     {
         private bool _isExecuting = false;
+        private long _lastDropTimestamp = 0;
 
         public MainWindow()
         {
+            App.Log("MainWindow.ctor enter");
             InitializeComponent();
+            App.Log("MainWindow.ctor InitializeComponent done");
 
             // Ensure window boundaries never overflow primary screen working area
             try
@@ -31,9 +34,13 @@ namespace DeepSeek
                     Height = Math.Min(700, workArea.Height - 40);
                     Left = workArea.Left + (workArea.Width - Width) / 2;
                     Top = workArea.Top + (workArea.Height - Height) / 2;
+                    App.Log($"Window size adjusted to: {Width}x{Height} at [{Left}, {Top}]");
                 }
             }
-            catch {}
+            catch (Exception ex)
+            {
+                App.Log($"WorkArea adjust error: {ex.Message}");
+            }
 
             try
             {
@@ -50,57 +57,48 @@ namespace DeepSeek
                     }
                 }
             }
-            catch {}
+            catch (Exception ex)
+            {
+                App.Log($"Icon load error: {ex.Message}");
+            }
 
             // Global shortcut handler that works even when WebView2 is focused
             ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
 
             Loaded += MainWindow_Loaded;
-        }
-
-        protected override void OnSourceInitialized(EventArgs e)
-        {
-            base.OnSourceInitialized(e);
-            var source = PresentationSource.FromVisual(this) as HwndSource;
-            source?.AddHook(WndProc);
-        }
-
-        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-        {
-            if ((uint)msg == App.WM_SHOW_DEEPSEEK)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    if (WindowState == WindowState.Minimized)
-                    {
-                        WindowState = WindowState.Maximized;
-                    }
-                    Show();
-                    Activate();
-                    Topmost = true;
-                    Topmost = false;
-                    Focus();
-                });
-                handled = true;
-            }
-            return IntPtr.Zero;
+            App.Log("MainWindow.ctor exit");
         }
 
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
+            App.Log("MainWindow_Loaded enter");
             await InitializeWebViewAsync();
+            App.Log("MainWindow_Loaded exit");
         }
 
         private async Task InitializeWebViewAsync()
         {
             try
             {
+                App.Log("InitializeWebViewAsync enter");
                 string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 string userDataFolder = Path.Combine(localAppData, "DeepSeek", "WebView2");
                 Directory.CreateDirectory(userDataFolder);
+                App.Log($"userDataFolder: {userDataFolder}");
 
-                var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+                // Optional remote-debugging port (set DEEPSEEK_DEBUG_PORT to enable CDP introspection)
+                var envOptions = new CoreWebView2EnvironmentOptions();
+                string dbgPort = Environment.GetEnvironmentVariable("DEEPSEEK_DEBUG_PORT");
+                if (!string.IsNullOrWhiteSpace(dbgPort))
+                {
+                    envOptions.AdditionalBrowserArguments = $"--remote-debugging-port={dbgPort} --remote-allow-origins=*";
+                    App.Log($"[Debug] remote debugging enabled on port {dbgPort}");
+                }
+                var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder, envOptions);
+                App.Log("CoreWebView2Environment.CreateAsync done");
+
                 await webView.EnsureCoreWebView2Async(env);
+                App.Log("EnsureCoreWebView2Async done");
 
                 webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
@@ -111,6 +109,7 @@ namespace DeepSeek
                 double initialZoom = LoadSavedZoomFactor();
                 webView.ZoomFactor = initialZoom;
                 UpdateZoomDisplay(initialZoom);
+                App.Log($"Applied initial zoom: {initialZoom}");
 
                 webView.ZoomFactorChanged += (s, ev) =>
                 {
@@ -132,13 +131,17 @@ namespace DeepSeek
                 if (!string.IsNullOrEmpty(bridgeScript))
                 {
                     await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(bridgeScript);
+                    App.Log($"agent_bridge.js script registered ({bridgeScript.Length} chars)");
                 }
 
                 // Navigate to DeepSeek
+                App.Log("Navigating to https://chat.deepseek.com ...");
                 webView.CoreWebView2.Navigate("https://chat.deepseek.com");
+                App.Log("Navigate called successfully");
             }
             catch (Exception ex)
             {
+                App.Log($"[ERROR] InitializeWebViewAsync failed: {ex}");
                 MessageBox.Show($"初始化 WebView2 失败: {ex.Message}\n请确保已安装 Microsoft Edge WebView2 运行时。", "DeepSeek 启动错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
@@ -192,6 +195,9 @@ namespace DeepSeek
                 if (!root.TryGetProperty("action", out var actionProp)) return;
                 string action = actionProp.GetString() ?? "";
 
+                // Diagnostic: record every bridge message except chatty js-log relays
+                if (action != "log") App.Log($"[Bridge] <- action={action}");
+
                 if (action == "log")
                 {
                     string msg = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() ?? "" : "";
@@ -215,6 +221,47 @@ namespace DeepSeek
                     {
                         _ = HandleFileWriteAsync(id, path, content);
                     }
+                }
+                else if (action == "paths_dropped")
+                {
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    if (now - _lastDropTimestamp < 400) return;
+                    _lastDropTimestamp = now;
+
+                    var droppedPaths = new System.Collections.Generic.List<string>();
+                    if (e.AdditionalObjects != null)
+                    {
+                        foreach (var obj in e.AdditionalObjects)
+                        {
+                            if (obj is CoreWebView2FileSystemHandle handle)
+                            {
+                                if (!string.IsNullOrEmpty(handle.Path)) droppedPaths.Add(handle.Path);
+                            }
+                            else if (obj is CoreWebView2File file)
+                            {
+                                if (!string.IsNullOrEmpty(file.Path)) droppedPaths.Add(file.Path);
+                            }
+                        }
+                    }
+                    if (root.TryGetProperty("paths", out var pathsProp) && pathsProp.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var item in pathsProp.EnumerateArray())
+                        {
+                            string? p = item.GetString();
+                            if (!string.IsNullOrEmpty(p)) droppedPaths.Add(p);
+                        }
+                    }
+
+                    App.Log($"[paths_dropped] Received {droppedPaths.Count} paths from WebView2: {string.Join(", ", droppedPaths)}");
+                    if (droppedPaths.Count > 0)
+                    {
+                        string formatted = FormatPathsForTerminal(droppedPaths);
+                        _ = InsertTextToChatAsync(formatted);
+                    }
+                }
+                else if (action == "test_clipboard_paste")
+                {
+                    TryHandleFileDropClipboardPaste();
                 }
             }
             catch (Exception ex)
@@ -435,6 +482,54 @@ namespace DeepSeek
             }
         }
 
+        /// <summary>
+        /// PowerShell serialises its error stream as CLIXML whenever stderr is redirected
+        /// (e.g. "#&lt; CLIXML &lt;Objs ...&gt;&lt;S S=\"Error\"&gt;real message&lt;/S&gt;&lt;/Objs&gt;").
+        /// That XML then leaked verbatim into the command output the planner reads, burying the
+        /// actual message. Unwrap it back to plain text. Note: $ProgressPreference suppression
+        /// (applied in the command prefix) removes the progress Obj; error records still need this.
+        /// </summary>
+        private static string CleanPowerShellStderr(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return raw;
+            const string marker = "#< CLIXML";
+            string trimmed = raw.TrimStart();
+            if (!trimmed.StartsWith(marker, StringComparison.Ordinal)) return raw;
+            try
+            {
+                // NOTE: search for the root element AFTER the marker -- the marker itself
+                // contains a '<' ("#<"), so a naive IndexOf('<') lands on that and the parse fails.
+                int lt = raw.IndexOf("<Objs", StringComparison.Ordinal);
+                if (lt < 0) return trimmed.Substring(marker.Length).Trim();
+                var doc = new System.Xml.XmlDocument { XmlResolver = null };
+                doc.LoadXml(raw.Substring(lt));
+
+                var sb = new StringBuilder();
+                var nodes = doc.SelectNodes("//*[local-name()='S']");
+                if (nodes != null)
+                {
+                    foreach (System.Xml.XmlNode n in nodes) sb.Append(n.InnerText);
+                }
+                if (sb.Length == 0 && doc.DocumentElement != null) sb.Append(doc.DocumentElement.InnerText);
+
+                string text = sb.ToString()
+                    .Replace("_x000D_", "")
+                    .Replace("_x000A_", "\n")
+                    .Replace("_x0009_", "\t")
+                    // CLIXML escapes a literal '_' as _x005F_, so this must be undone LAST:
+                    // doing it first could synthesise a fresh _x000A_ that then decodes wrongly.
+                    .Replace("_x005F_", "_")
+                    .Replace("\r\n", "\n")
+                    .Trim();
+                return text;
+            }
+            catch
+            {
+                // Payload was not well-formed XML -- strip the marker and move on.
+                return trimmed.Substring(marker.Length).Trim();
+            }
+        }
+
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
             if (_isExecuting) return;
@@ -454,7 +549,10 @@ namespace DeepSeek
             try
             {
                 // Execute via powershell.exe using -EncodedCommand for 100% robust cross-platform scripting
-                byte[] bytes = Encoding.Unicode.GetBytes(command);
+                // NOTE: with redirected stderr PowerShell serialises its progress stream as CLIXML
+                // (e.g. `<Objs Version="1.1.0.1" ...><Obj S="progress"`), which then leaked into the
+                // command output the planner reads. Suppress the progress stream at the source.
+                byte[] bytes = Encoding.Unicode.GetBytes("$ProgressPreference='SilentlyContinue'; " + command);
                 string base64 = Convert.ToBase64String(bytes);
 
                 var psi = new ProcessStartInfo
@@ -504,7 +602,7 @@ namespace DeepSeek
                 }
 
                 string outStr = outSb.ToString();
-                string errStr = errSb.ToString();
+                string errStr = CleanPowerShellStderr(errSb.ToString());
 
                 if (!string.IsNullOrEmpty(outStr)) output += outStr;
                 if (!string.IsNullOrEmpty(errStr))
@@ -657,11 +755,41 @@ namespace DeepSeek
             webView.CoreWebView2?.Navigate("https://chat.deepseek.com");
         }
 
+        // JS probe: reports bridge install state and every candidate input element on the page
+        private const string InjectProbeJs =
+            "JSON.stringify({" +
+            "hasBridge:!!window.__agentBridge," +
+            "installed:!!window.__agentBridgeInstalled," +
+            "url:location.href," +
+            "rs:document.readyState," +
+            "hudBtn:!!document.getElementById('agent-inject-btn')," +
+            "textareas:[...document.querySelectorAll('textarea')].map(t=>({id:t.id,cls:String(t.className).slice(0,50),ph:t.placeholder,dis:t.disabled}))," +
+            "ces:[...document.querySelectorAll('[contenteditable]')].map(x=>({tag:x.tagName,cls:String(x.className).slice(0,50)}))" +
+            "})";
+
         private async void MenuInjectPrompt_Click(object sender, RoutedEventArgs e)
         {
-            if (webView.CoreWebView2 != null)
+            if (webView?.CoreWebView2 == null)
             {
-                await webView.CoreWebView2.ExecuteScriptAsync("window.__agentBridge && window.__agentBridge.injectSystemPrompt();");
+                App.Log("[Inject] CoreWebView2 is null - window not ready");
+                return;
+            }
+            try
+            {
+                string probe = await webView.CoreWebView2.ExecuteScriptAsync(InjectProbeJs);
+                App.Log($"[Inject] PROBE {probe}");
+
+                string res = await webView.CoreWebView2.ExecuteScriptAsync(
+                    "window.__agentBridge && window.__agentBridge.injectSystemPrompt();");
+                App.Log($"[Inject] injectSystemPrompt returned: {res}");
+
+                string after = await webView.CoreWebView2.ExecuteScriptAsync(
+                    "(function(){var t=document.querySelector('textarea');return JSON.stringify({len: t?t.value.length:-1, head: t?t.value.slice(0,80):null});})()");
+                App.Log($"[Inject] AFTER {after}");
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[Inject] ERROR {ex}");
             }
         }
 
@@ -772,11 +900,22 @@ namespace DeepSeek
             if (msg.message == WM_KEYDOWN)
             {
                 bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+                bool shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
+                int vk = (int)msg.wParam;
+
                 if (ctrl)
                 {
-                    int vk = (int)msg.wParam;
+                    // 'V' (0x56) - Terminal-style file path paste
+                    if (vk == 0x56)
+                    {
+                        if (TryHandleFileDropClipboardPaste())
+                        {
+                            handled = true;
+                            return;
+                        }
+                    }
                     // VK_OEM_MINUS (189) or VK_SUBTRACT (109)
-                    if (vk == 0xBD || vk == 0x6D)
+                    else if (vk == 0xBD || vk == 0x6D)
                     {
                         MenuZoomOut_Click(this, new RoutedEventArgs());
                         handled = true;
@@ -808,14 +947,128 @@ namespace DeepSeek
                     // 'R' (82)
                     else if (vk == 0x52)
                     {
-                        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+                        if (shift)
                             MenuForceReload_Click(this, new RoutedEventArgs());
                         else
                             MenuReload_Click(this, new RoutedEventArgs());
                         handled = true;
                     }
                 }
+                else if (shift && vk == 0x2D) // Shift + VK_INSERT
+                {
+                    if (TryHandleFileDropClipboardPaste())
+                    {
+                        handled = true;
+                        return;
+                    }
+                }
             }
+        }
+
+        private void Window_PreviewDragOver(object sender, DragEventArgs e)
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                e.Effects = DragDropEffects.Copy;
+                e.Handled = true;
+            }
+        }
+
+        private async void Window_PreviewDrop(object sender, DragEventArgs e)
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                if (now - _lastDropTimestamp < 400)
+                {
+                    e.Handled = true;
+                    return;
+                }
+                _lastDropTimestamp = now;
+
+                string[]? files = e.Data.GetData(DataFormats.FileDrop) as string[];
+                if (files != null && files.Length > 0)
+                {
+                    e.Handled = true;
+                    App.Log($"[WPF Drop] Received {files.Length} files: {string.Join(", ", files)}");
+                    string formatted = FormatPathsForTerminal(files);
+                    await InsertTextToChatAsync(formatted);
+                }
+            }
+        }
+
+        public static string FormatPathsForTerminal(System.Collections.Generic.IEnumerable<string> paths)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            foreach (var p in paths)
+            {
+                if (string.IsNullOrWhiteSpace(p)) continue;
+                string path = p.Trim();
+                if (path.StartsWith("\"") && path.EndsWith("\"") && path.Length >= 2)
+                {
+                    path = path.Substring(1, path.Length - 2).Trim();
+                }
+                if (path.Contains(' '))
+                {
+                    list.Add($"\"{path}\"");
+                }
+                else
+                {
+                    list.Add(path);
+                }
+            }
+            if (list.Count == 0) return "";
+            return string.Join(" ", list) + " ";
+        }
+
+        public async Task<bool> InsertTextToChatAsync(string text)
+        {
+            if (string.IsNullOrEmpty(text) || webView?.CoreWebView2 == null) return false;
+
+            try
+            {
+                string json = JsonSerializer.Serialize(text);
+                string script = $"window.__agentBridge && window.__agentBridge.insertText ? window.__agentBridge.insertText({json}) : false;";
+                string res = await webView.CoreWebView2.ExecuteScriptAsync(script);
+                App.Log($"[InsertTextToChat] Inserted text length={text.Length}, result: {res}");
+                return res == "true";
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[InsertTextToChat] Error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TryHandleFileDropClipboardPaste()
+        {
+            try
+            {
+                if (Clipboard.ContainsFileDropList())
+                {
+                    var dropList = Clipboard.GetFileDropList();
+                    if (dropList != null && dropList.Count > 0)
+                    {
+                        var paths = new System.Collections.Generic.List<string>();
+                        foreach (string? p in dropList)
+                        {
+                            if (!string.IsNullOrWhiteSpace(p)) paths.Add(p);
+                        }
+                        if (paths.Count > 0)
+                        {
+                            App.Log($"[Clipboard Paste] File drop detected ({paths.Count} items): {string.Join(", ", paths)}");
+                            string formatted = FormatPathsForTerminal(paths);
+                            _ = InsertTextToChatAsync(formatted);
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[Clipboard Paste] Error checking clipboard: {ex.Message}");
+            }
+            return false;
         }
 
         private void MenuExit_Click(object sender, RoutedEventArgs e)

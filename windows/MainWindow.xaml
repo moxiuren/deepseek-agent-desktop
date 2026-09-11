@@ -4,8 +4,11 @@
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
         Title="DeepSeek" Height="700" Width="1180"
         MinWidth="800" MinHeight="500"
-        WindowStartupLocation="CenterScreen"
-        WindowState="Maximized"
+        WindowStartupLocation="Manual"
+        WindowState="Normal"
+        AllowDrop="True"
+        PreviewDragOver="Window_PreviewDragOver"
+        PreviewDrop="Window_PreviewDrop"
         Background="#181C27">
     <Grid>
         <Grid.RowDefinitions>
@@ -64,6 +67,6 @@
             </DockPanel>
         </Border>
 
-        <wv2:WebView2 Grid.Row="1" x:Name="webView" DefaultBackgroundColor="#181C27"/>
+        <wv2:WebView2 Grid.Row="1" x:Name="webView" DefaultBackgroundColor="#181C27" AllowDrop="True"/>
     </Grid>
 </Window>

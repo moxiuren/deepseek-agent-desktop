@@ -1,6 +1,9 @@
 (function() {
     if (window.__agentBridgeInstalled) return;
     window.__agentBridgeInstalled = true;
+    // Defence-in-depth: any unexpected init failure must be LOUD, never silently leave the
+    // native side calling into an undefined window.__agentBridge.
+    try {
 
     // Cross-platform native bridge dispatcher (supports macOS WebKit & Windows Edge WebView2)
     function sendToNative(data) {
@@ -127,11 +130,30 @@ agent-attach 文件路径 "说明或提示"
             transition: all 0.25s ease;
         }
     `;
-    document.head.appendChild(style);
+    // NOTE (Windows/WebView2 port fix): this script is registered via
+    // AddScriptToExecuteOnDocumentCreatedAsync, which -- unlike WKWebView's
+    // .atDocumentStart on macOS -- fires when the document is COMPLETELY EMPTY:
+    // both document.documentElement and document.head are still null. The original
+    // eager `document.head.appendChild(style)` threw a TypeError, aborted this IIFE,
+    // and left window.__agentBridge undefined, so every native call silently no-op'd
+    // behind the `window.__agentBridge && ...` short-circuit. Defer until a root exists.
+    function whenRootReady(fn) {
+        if (document.head || document.documentElement) { fn(); return; }
+        document.addEventListener('DOMContentLoaded', fn, { once: true });
+        const t = setInterval(() => {
+            if (document.head || document.documentElement) { clearInterval(t); fn(); }
+        }, 30);
+    }
+    whenRootReady(() => {
+        (document.head || document.documentElement).appendChild(style);
+    });
 
     // 1. Floating HUD
     function createFloatingHUD() {
         if (document.getElementById('deepseek-agent-hud')) return;
+        // Same document-creation hazard as the <style> insert above: the MutationObserver
+        // watching documentElement can fire before <body> has been parsed.
+        if (!document.body) return;
 
         const hud = document.createElement('div');
         hud.id = 'deepseek-agent-hud';
@@ -631,6 +653,9 @@ agent-attach 文件路径 "说明或提示"
 
     // 5. Hide / Collapse Ugly User Feedback Messages into Sleek Compact Badges!
     function collapseToolFeedbackBubbles() {
+        // The MutationObserver now watches `document`, so this can fire before <body> exists
+        // (WebView2 runs the script at document-creation). createTreeWalker requires a Node.
+        if (!document.body) return;
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         let node;
         const textNodes = [];
@@ -773,6 +798,27 @@ agent-attach 文件路径 "说明或提示"
 
     // 6. Handle Native Result + Polite Pacing
     window.__agentBridge = {
+        // Diagnostics surface: lets the native side (or a CDP session) verify the DOM
+        // wiring without actually sending a message into the conversation.
+        _debug: {
+            findInputTextarea: findInputTextarea,
+            findSendButton: findSendButton,
+            describeSendButton: function() {
+                const b = findSendButton();
+                if (!b) return { found: false };
+                const r = b.getBoundingClientRect();
+                return {
+                    found: true,
+                    tag: b.tagName,
+                    cls: String(b.className),
+                    disabled: isControlDisabled(b),
+                    rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
+                };
+            }
+        },
+        insertText: function(text) {
+            return insertTextAtCursor(text);
+        },
         injectSystemPrompt: function() {
             injectPrompt(SYSTEM_PROMPT, true);
         },
@@ -900,28 +946,62 @@ ${output}
         }
     }
 
+    // A <div role="button"> has no .disabled property -- DeepSeek expresses the disabled
+    // state through the `ds-button--disabled` class, so BOTH must be checked.
+    function isControlDisabled(el) {
+        return !!el.disabled || el.classList.contains('ds-button--disabled');
+    }
+
+    function findSendButton() {
+        const isVisible = el => { const r = el.getBoundingClientRect(); return r.width > 4 && r.height > 4; };
+        const clickable = [...document.querySelectorAll('button, [role="button"]')].filter(isVisible);
+
+        // 1. Explicit accessible name -- cheapest when the locale/version provides one.
+        let btn = clickable.find(b => {
+            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
+            return label.includes('send') || label.includes('发送');
+        });
+        if (btn) return btn;
+
+        // 2. DeepSeek's own design-system modifier. The send control is the only
+        //    primary+circle icon button in the composer. classList.contains() matches an
+        //    EXACT token, so this does NOT collide with the neighbouring
+        //    `ds-button--iconLabelPrimary` (a different token entirely).
+        btn = clickable.find(b =>
+            b.classList.contains('ds-button--primary') &&
+            b.classList.contains('ds-button--circle') &&
+            !isControlDisabled(b));
+        if (btn) return btn;
+
+        // 3. Geometric fallback: rightmost visible clickable element on the composer row.
+        //    Survives class-name churn (their classes are hashed and change on deploy).
+        const ta = findInputTextarea();
+        if (ta) {
+            const tr = ta.getBoundingClientRect();
+            const row = clickable
+                .map(b => ({ b, r: b.getBoundingClientRect() }))
+                .filter(o => o.r.left > tr.left && o.r.top >= tr.top - 20 && o.r.bottom <= tr.bottom + 70)
+                .sort((a, c) => c.r.left - a.r.left);
+            if (row.length) return row[0].b;
+        }
+        return null;
+    }
+
     function triggerSend() {
         const textarea = findInputTextarea();
         if (!textarea) return false;
 
-        const container = textarea.closest('div[class*="input"], form') || textarea.parentElement;
-        const allButtons = Array.from(document.querySelectorAll('button, div[role="button"]'));
-
-        let sendBtn = allButtons.find(b => {
-            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-            const title = (b.getAttribute('title') || '').toLowerCase();
-            return (aria.includes('发送') || aria.includes('send') || title.includes('发送') || title.includes('send')) && !b.disabled;
-        });
-
-        if (!sendBtn && container) {
-            sendBtn = Array.from(container.querySelectorAll('button')).find(b => b.querySelector('svg') && !b.disabled);
-        }
-
-        if (sendBtn && !sendBtn.disabled) {
+        // NOTE (Windows port fix): the send control on chat.deepseek.com is a
+        // <div role="button">, NOT a <button>. The original fallback queried
+        // container.querySelectorAll('button') and could therefore never find it, so
+        // injected prompts sat in the box unsent -- the exact "no effect" symptom.
+        const sendBtn = findSendButton();
+        if (sendBtn && !isControlDisabled(sendBtn)) {
             sendBtn.click();
             return true;
         }
 
+        // Last resort: synthetic Enter on the composer.
         const enterEv = new KeyboardEvent('keydown', {
             key: 'Enter',
             code: 'Enter',
@@ -957,6 +1037,146 @@ ${output}
         }
     }
 
+    function insertTextAtCursor(text) {
+        if (!text) return false;
+        const el = findInputTextarea();
+        if (!el) {
+            console.error("[Agent Bridge] Textarea not found for insertText!");
+            return false;
+        }
+
+        el.focus();
+        let toInsert = text;
+
+        if (el.tagName === 'TEXTAREA') {
+            const start = (typeof el.selectionStart === 'number') ? el.selectionStart : el.value.length;
+            const end = (typeof el.selectionEnd === 'number') ? el.selectionEnd : el.value.length;
+            const val = el.value || '';
+
+            // Add leading space if preceding character is not whitespace and toInsert does not start with whitespace
+            if (start > 0 && !/\s/.test(val[start - 1]) && !/^\s/.test(toInsert)) {
+                toInsert = ' ' + toInsert;
+            }
+
+            // Attempt 1: execCommand ('insertText') - updates React internal state & preserves undo stack
+            let success = false;
+            try {
+                success = document.execCommand('insertText', false, toInsert);
+            } catch (_) {}
+
+            // Attempt 2: native setter fallback if execCommand was not effective
+            if (!success || el.value === val) {
+                const nextVal = val.slice(0, start) + toInsert + val.slice(end);
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+                if (nativeSetter) {
+                    nativeSetter.call(el, nextVal);
+                } else {
+                    el.value = nextVal;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                try {
+                    const newPos = start + toInsert.length;
+                    el.setSelectionRange(newPos, newPos);
+                } catch (_) {}
+            }
+        } else {
+            // ContentEditable
+            let success = false;
+            try {
+                success = document.execCommand('insertText', false, toInsert);
+            } catch (_) {}
+            if (!success) {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) {
+                    const range = sel.getRangeAt(0);
+                    range.deleteContents();
+                    const textNode = document.createTextNode(toInsert);
+                    range.insertNode(textNode);
+                    range.setStartAfter(textNode);
+                    range.setEndAfter(textNode);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return true;
+    }
+
+    // Terminal-style Drag & Drop file path support
+    function setupDragAndDropPathHandler() {
+        const hasFiles = (dt) => {
+            if (!dt || !dt.types) return false;
+            const types = Array.from(dt.types);
+            return types.includes('Files') || types.includes('application/x-moz-file');
+        };
+
+        window.addEventListener('dragenter', (e) => {
+            if (hasFiles(e.dataTransfer)) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        }, true);
+
+        window.addEventListener('dragover', (e) => {
+            if (hasFiles(e.dataTransfer)) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.dataTransfer.dropEffect = 'copy';
+            }
+        }, true);
+
+        window.addEventListener('drop', async (e) => {
+            if (!hasFiles(e.dataTransfer)) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            const items = e.dataTransfer.items;
+            const files = e.dataTransfer.files;
+
+            let handles = [];
+            if (items && items.length > 0) {
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.kind === 'file') {
+                        if (typeof item.getAsFileSystemHandle === 'function') {
+                            try {
+                                const h = await item.getAsFileSystemHandle();
+                                if (h) handles.push(h);
+                            } catch (_) {}
+                        }
+                    }
+                }
+            }
+
+            if (handles.length > 0 && window.chrome?.webview?.postMessageWithAdditionalObjects) {
+                try {
+                    window.chrome.webview.postMessageWithAdditionalObjects(
+                        { action: "paths_dropped" },
+                        handles
+                    );
+                    return;
+                } catch (err) {
+                    console.error("[Agent Bridge] postMessageWithAdditionalObjects (handles) error:", err);
+                }
+            }
+
+            if (files && files.length > 0 && window.chrome?.webview?.postMessageWithAdditionalObjects) {
+                try {
+                    window.chrome.webview.postMessageWithAdditionalObjects(
+                        { action: "paths_dropped" },
+                        Array.from(files)
+                    );
+                    return;
+                } catch (err) {
+                    console.error("[Agent Bridge] postMessageWithAdditionalObjects (files) error:", err);
+                }
+            }
+        }, true);
+    }
+
     // 8. Loop
     const observer = new MutationObserver(() => {
         createFloatingHUD();
@@ -964,7 +1184,10 @@ ${output}
         collapseToolFeedbackBubbles();
     });
 
-    observer.observe(document.documentElement, {
+    // Observe `document` rather than document.documentElement: at document-creation time in
+    // WebView2 documentElement is still null, so observing it would throw here -- after the
+    // API export, which would silently disable tool-call scanning for the whole session.
+    observer.observe(document, {
         childList: true,
         subtree: true,
         characterData: true
@@ -976,6 +1199,11 @@ ${output}
         collapseToolFeedbackBubbles();
     }, 600);
 
+    setupDragAndDropPathHandler();
     setTimeout(createFloatingHUD, 800);
-    console.log("[Agent Bridge] Tool Call Engine v4 Ready.");
+    console.log("[Agent Bridge] Tool Call Engine v4 Ready (with Terminal-style Drag&Drop & Paste).");
+
+    } catch (e) {
+        console.error("[Agent Bridge] FATAL init error: " + (e && e.stack ? e.stack : e));
+    }
 })();

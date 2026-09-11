@@ -1,49 +1,40 @@
 using System;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Threading;
+using System.IO;
 using System.Windows;
 
 namespace DeepSeek
 {
     public partial class App : Application
     {
-        private static Mutex? _mutex;
-        private const string MutexName = "DeepSeek_Windows_Agent_Client_Mutex_2026";
-
-        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        public static extern uint RegisterWindowMessage(string lpString);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
-        public static readonly uint WM_SHOW_DEEPSEEK = RegisterWindowMessage("DEEPSEEK_AGENT_RESTORE_WINDOW_2026");
-
-        protected override void OnStartup(StartupEventArgs e)
-        {
-            _mutex = new Mutex(true, MutexName, out bool isNewInstance);
-
-            if (!isNewInstance)
-            {
-                // Broadcast wake-up message to the running instance
-                PostMessage(HWND_BROADCAST, WM_SHOW_DEEPSEEK, IntPtr.Zero, IntPtr.Zero);
-                Shutdown();
-                return;
-            }
-
-            base.OnStartup(e);
-        }
-
-        protected override void OnExit(ExitEventArgs e)
+        public static void Log(string msg)
         {
             try
             {
-                _mutex?.ReleaseMutex();
-                _mutex?.Dispose();
+                string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "deepseek_debug.log");
+                File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}\r\n");
             }
             catch {}
-            base.OnExit(e);
+        }
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            Log("=== App.OnStartup enter ===");
+
+            AppDomain.CurrentDomain.UnhandledException += (s, args) =>
+            {
+                Log($"[CRITICAL] AppDomain UnhandledException: {args.ExceptionObject}");
+                MessageBox.Show($"未捕获异常: {args.ExceptionObject}", "DeepSeek 启动崩溃", MessageBoxButton.OK, MessageBoxImage.Error);
+            };
+
+            DispatcherUnhandledException += (s, args) =>
+            {
+                Log($"[CRITICAL] DispatcherUnhandledException: {args.Exception}");
+                MessageBox.Show($"界面未处理异常: {args.Exception.Message}", "DeepSeek 错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                args.Handled = true;
+            };
+
+            base.OnStartup(e);
+            Log("base.OnStartup done");
         }
     }
 }
