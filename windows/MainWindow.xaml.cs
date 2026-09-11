@@ -1130,7 +1130,7 @@ namespace DeepSeek
         private const string InjectProbeJs =
             "JSON.stringify({" +
             "hasBridge:!!window.__agentBridge," +
-            "installed:!!window.__agentBridgeInstalled," +
+            "installed:!!window.__agentBridge," +
             "url:location.href," +
             "rs:document.readyState," +
             "hudBtn:!!document.getElementById('agent-inject-btn')," +

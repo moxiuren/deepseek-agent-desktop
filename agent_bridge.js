@@ -18,23 +18,31 @@
         }
     }
 
-    // Forward console logs to native host
+    // Forward console logs to native host.
+    // Wrapped in Proxy so toString checks still see native code.
     const _origLog = console.log;
     const _origErr = console.error;
-    console.log = function(...args) {
-        _origLog.apply(console, args);
+    function stealthWrapFn(fn, trap) {
+        try {
+            return new Proxy(fn, { apply: function(t, th, args) { return trap(t, th, args); } });
+        } catch (_) {
+            return fn;
+        }
+    }
+    console.log = stealthWrapFn(_origLog, function(t, th, args) {
+        Reflect.apply(t, th, args);
         sendToNative({
             action: "log",
-            message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
+            message: Array.prototype.map.call(args, a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
         });
-    };
-    console.error = function(...args) {
-        _origErr.apply(console, args);
+    });
+    console.error = stealthWrapFn(_origErr, function(t, th, args) {
+        Reflect.apply(t, th, args);
         sendToNative({
             action: "log",
-            message: "[JS_ERROR] " + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
+            message: "[JS_ERROR] " + Array.prototype.map.call(args, a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
         });
-    };
+    });
 
     console.log("[Agent Bridge] Initializing Tool Call Engine v4 (Cross-Platform Edition)...");
 
@@ -83,7 +91,7 @@
                     clearInterval(iv);
                     prevSendAt = Date.now();
                     prevAcked = false;
-                    try { window.__lastSendAt = prevSendAt; } catch (_) {}
+                    try { window.__lastSendAt = prevSendAt; hideGlobal('__lastSendAt'); } catch (_) {}
                     try { fn((acked) => { prevAcked = !!acked; resolve(); }); }
                     catch (_) { prevAcked = true; resolve(); }
                 }
@@ -96,6 +104,14 @@
     let cardControllers = {};
     let blockWatchMap = new Map();
     let pendingFeedbackTimer = null;
+    // Processed/collapsed tracking lives in WeakSets, NOT data-* attributes,
+    // so our bookkeeping leaves no DOM fingerprints.
+    const processedBlocks = new WeakSet();
+    const collapsedBubblesSet = new WeakSet();
+    // Hide our window globals from enumeration (Object.keys/for-in).
+    function hideGlobal(name) {
+        try { Object.defineProperty(window, name, { enumerable: false }); } catch (_) {}
+    }
 
     function isQuoteBalanced(cmd) {
         let inDouble = false;
@@ -593,10 +609,10 @@
         } catch (_) {}
 
         for (let el of blocks) {
-            if (el.dataset.agentProcessed) continue;
+            if (processedBlocks.has(el)) continue;
 
             const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
-            if (parent.dataset.agentProcessed) continue;
+            if (processedBlocks.has(parent)) continue;
 
             // Never scan our own UI (HUD / tool cards / collapsed pills).
             try {
@@ -662,8 +678,8 @@
                 continue;
             }
 
-            el.dataset.agentProcessed = "true";
-            parent.dataset.agentProcessed = "true";
+            processedBlocks.add(el);
+            processedBlocks.add(parent);
             blockWatchMap.delete(parent);
 
             if (isFileWrite) {
@@ -782,7 +798,7 @@
             let container = tn.parentElement;
             // Climb up to the user message wrapper or bubble
             while (container && container !== document.body) {
-                if (container.dataset.agentCollapsed) break;
+                if (collapsedBubblesSet.has(container)) break;
 
                 // Check if this container is a user message container
                 const isMsg = container.classList && (
@@ -793,8 +809,8 @@
                     (container.parentElement && container.parentElement.className.includes('chat-item'))
                 );
 
-                if (isMsg && !container.dataset.agentCollapsed) {
-                    container.dataset.agentCollapsed = "true";
+                if (isMsg && !collapsedBubblesSet.has(container)) {
+                    collapsedBubblesSet.add(container);
 
                     // Create compact pill
                     const pill = document.createElement('div');
@@ -843,7 +859,7 @@
 
                     container.appendChild(pill);
                     container.appendChild(contentWrapper);
-                    try { window.__collapsedBubbles = (window.__collapsedBubbles || 0) + 1; } catch (_) {}
+                    try { window.__collapsedBubbles = (window.__collapsedBubbles || 0) + 1; hideGlobal('__collapsedBubbles'); } catch (_) {}
                     break;
                 }
                 container = container.parentElement;
@@ -1241,6 +1257,7 @@ ${output}
             pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
         }
     };
+    hideGlobal('__agentBridge');
 
     // 7. Textarea Injection & Send
     function findInputTextarea() {
@@ -1535,20 +1552,52 @@ ${output}
         }, true);
     }
 
-    // 8. Loop
-    const observer = new MutationObserver(() => {
-        createFloatingHUD();
-        scanAndProcessToolCalls();
-        collapseToolFeedbackBubbles();
+    // 8. Loop (throttled: our own DOM writes must never re-trigger scans,
+    // otherwise live streaming feeds a feedback storm that wedges the renderer)
+    let scanScheduled = false;
+    let lastScanAt = 0;
+    function isOwnUi(node) {
+        try {
+            const el = (node && node.nodeType === 1) ? node : (node && node.parentElement);
+            return !!(el && el.closest && el.closest('[id^="agent-"],[id^="tool-card-"],.agent-tool-card,.agent-collapsed-pill'));
+        } catch (_) { return false; }
+    }
+    function scheduleScan() {
+        if (scanScheduled) return;
+        const wait = Math.max(0, 400 - (Date.now() - lastScanAt));
+        scanScheduled = true;
+        setTimeout(() => {
+            scanScheduled = false;
+            lastScanAt = Date.now();
+            try { scanAndProcessToolCalls(); } catch (_) {}
+            try { collapseToolFeedbackBubbles(); } catch (_) {}
+        }, wait);
+    }
+    const observer = new MutationObserver((muts) => {
+        try { createFloatingHUD(); } catch (_) {}
+        try {
+            for (const m of muts) {
+                if (m.target && isOwnUi(m.target)) continue;
+                let foreign = true;
+                try {
+                    for (const n of m.addedNodes) {
+                        if (isOwnUi(n)) { foreign = false; break; }
+                    }
+                } catch (_) {}
+                if (!foreign) continue;
+                scheduleScan();
+                break;
+            }
+        } catch (_) {}
     });
 
     // Observe `document` rather than document.documentElement: at document-creation time in
     // WebView2 documentElement is still null, so observing it would throw here -- after the
     // API export, which would silently disable tool-call scanning for the whole session.
+    // NOTE: no characterData — text streaming is covered by the interval below.
     observer.observe(document, {
         childList: true,
-        subtree: true,
-        characterData: true
+        subtree: true
     });
 
     setInterval(() => {

@@ -71,6 +71,10 @@
         toNative(rec);
     }
 
+    function hideGlobalSniff(name) {
+        try { Object.defineProperty(window, name, { enumerable: false }); } catch (_) {}
+    }
+
     // --- upload flight tracking (consumed by agent_bridge readiness check) ---
     // Counts in-flight POSTs to the file-upload endpoint so the bridge can tell
     // "upload finished" at the network layer instead of guessing DOM classes.
@@ -78,6 +82,8 @@
     // Timestamp of the last chat-completion POST: the bridge uses it as
     // "previous send has left" to serialize feedback sends.
     window.__lastCompletionAt = 0;
+    hideGlobalSniff('__uploadState');
+    hideGlobalSniff('__lastCompletionAt');
     function isUploadUrl(u) {
         try { return /\/api\/v0\/file\/upload_file/.test(String(u || '')); } catch (_) { return false; }
     }
