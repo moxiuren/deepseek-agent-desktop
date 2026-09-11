@@ -11,14 +11,14 @@ namespace DeepSeek
         private static Mutex? _mutex;
         private const string MutexName = "DeepSeek_Windows_Agent_Client_Mutex_2026";
 
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern uint RegisterWindowMessage(string lpString);
 
-        [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
-        private const int SW_RESTORE = 9;
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+        public static readonly uint WM_SHOW_DEEPSEEK = RegisterWindowMessage("DEEPSEEK_AGENT_RESTORE_WINDOW_2026");
 
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -26,16 +26,8 @@ namespace DeepSeek
 
             if (!isNewInstance)
             {
-                var current = Process.GetCurrentProcess();
-                foreach (var proc in Process.GetProcessesByName(current.ProcessName))
-                {
-                    if (proc.Id != current.Id && proc.MainWindowHandle != IntPtr.Zero)
-                    {
-                        ShowWindow(proc.MainWindowHandle, SW_RESTORE);
-                        SetForegroundWindow(proc.MainWindowHandle);
-                        break;
-                    }
-                }
+                // Broadcast wake-up message to the running instance
+                PostMessage(HWND_BROADCAST, WM_SHOW_DEEPSEEK, IntPtr.Zero, IntPtr.Zero);
                 Shutdown();
                 return;
             }

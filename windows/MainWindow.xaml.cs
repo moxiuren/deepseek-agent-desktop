@@ -58,6 +58,34 @@ namespace DeepSeek
             Loaded += MainWindow_Loaded;
         }
 
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            var source = PresentationSource.FromVisual(this) as HwndSource;
+            source?.AddHook(WndProc);
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if ((uint)msg == App.WM_SHOW_DEEPSEEK)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (WindowState == WindowState.Minimized)
+                    {
+                        WindowState = WindowState.Maximized;
+                    }
+                    Show();
+                    Activate();
+                    Topmost = true;
+                    Topmost = false;
+                    Focus();
+                });
+                handled = true;
+            }
+            return IntPtr.Zero;
+        }
+
         private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             await InitializeWebViewAsync();
