@@ -156,6 +156,9 @@ agent-attach 文件路径 "说明或提示"
             user-select: none;
         `;
 
+        const isMac = navigator.platform?.toUpperCase().indexOf('MAC') >= 0 || navigator.userAgent?.indexOf('Macintosh') >= 0;
+        const shortcutKey = isMac ? "⌘I" : "Ctrl+I";
+
         hud.innerHTML = `
             <div style="display: flex; align-items: center; gap: 6px; font-weight: 600;">
                 <span id="agent-hud-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #10b981; display: inline-block;"></span>
@@ -171,7 +174,7 @@ agent-attach 文件路径 "说明或提示"
                 font-size: 11px;
                 font-weight: 500;
                 cursor: pointer;
-            ">⚡️ 注入协议 (⌘I)</button>
+            ">注入协议 (${shortcutKey})</button>
             <button id="agent-toggle-btn" style="
                 background: rgba(0,0,0,0.05);
                 color: #334155;

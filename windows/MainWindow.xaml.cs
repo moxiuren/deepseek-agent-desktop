@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 using Microsoft.Web.WebView2.Core;
 
 namespace DeepSeek
@@ -19,6 +20,21 @@ namespace DeepSeek
         public MainWindow()
         {
             InitializeComponent();
+
+            // Ensure window boundaries never overflow primary screen working area
+            try
+            {
+                var workArea = SystemParameters.WorkArea;
+                if (workArea.Width > 0 && workArea.Height > 0)
+                {
+                    Width = Math.Min(1180, workArea.Width - 40);
+                    Height = Math.Min(700, workArea.Height - 40);
+                    Left = workArea.Left + (workArea.Width - Width) / 2;
+                    Top = workArea.Top + (workArea.Height - Height) / 2;
+                }
+            }
+            catch {}
+
             try
             {
                 string exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
@@ -35,6 +51,10 @@ namespace DeepSeek
                 }
             }
             catch {}
+
+            // Global shortcut handler that works even when WebView2 is focused
+            ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
+
             Loaded += MainWindow_Loaded;
         }
 
@@ -57,6 +77,21 @@ namespace DeepSeek
                 webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
                 webView.CoreWebView2.Settings.IsBuiltInErrorPageEnabled = true;
+                webView.CoreWebView2.Settings.IsZoomControlEnabled = true;
+
+                // Load and apply saved zoom factor or optimal preset for screen
+                double initialZoom = LoadSavedZoomFactor();
+                webView.ZoomFactor = initialZoom;
+                UpdateZoomDisplay(initialZoom);
+
+                webView.ZoomFactorChanged += (s, ev) =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        UpdateZoomDisplay(webView.ZoomFactor);
+                        SaveZoomFactor(webView.ZoomFactor);
+                    });
+                };
 
                 // Open external links in user's default browser
                 webView.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
@@ -615,19 +650,144 @@ namespace DeepSeek
             }
         }
 
+        public void SetZoom(double factor)
+        {
+            factor = Math.Round(Math.Clamp(factor, 0.4, 2.5), 2);
+            if (webView?.CoreWebView2 != null)
+            {
+                webView.ZoomFactor = factor;
+            }
+            UpdateZoomDisplay(factor);
+            SaveZoomFactor(factor);
+        }
+
+        private void UpdateZoomDisplay(double factor)
+        {
+            if (btnZoomFactor != null)
+            {
+                btnZoomFactor.Content = $"{Math.Round(factor * 100)}%";
+            }
+        }
+
         private void MenuZoomIn_Click(object sender, RoutedEventArgs e)
         {
-            if (webView.CoreWebView2 != null) webView.ZoomFactor += 0.1;
+            double current = webView?.ZoomFactor ?? 1.0;
+            SetZoom(current + 0.1);
         }
 
         private void MenuZoomOut_Click(object sender, RoutedEventArgs e)
         {
-            if (webView.CoreWebView2 != null && webView.ZoomFactor > 0.3) webView.ZoomFactor -= 0.1;
+            double current = webView?.ZoomFactor ?? 1.0;
+            SetZoom(current - 0.1);
         }
 
         private void MenuZoomReset_Click(object sender, RoutedEventArgs e)
         {
-            if (webView.CoreWebView2 != null) webView.ZoomFactor = 1.0;
+            SetZoom(1.0);
+        }
+
+        private void MenuZoomFit_Click(object sender, RoutedEventArgs e)
+        {
+            SetZoom(0.85);
+        }
+
+        private static string GetSettingsFilePath()
+        {
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string folder = Path.Combine(appData, "DeepSeek");
+            Directory.CreateDirectory(folder);
+            return Path.Combine(folder, "client_settings.json");
+        }
+
+        private static double LoadSavedZoomFactor()
+        {
+            try
+            {
+                string file = GetSettingsFilePath();
+                if (File.Exists(file))
+                {
+                    string json = File.ReadAllText(file);
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("zoomFactor", out var zProp) && zProp.TryGetDouble(out var z))
+                    {
+                        if (z >= 0.4 && z <= 2.5) return z;
+                    }
+                }
+            }
+            catch {}
+
+            // Screen resolution heuristics: 1280x800 and 1366x768 screens benefit from 85% zoom
+            if (SystemParameters.PrimaryScreenWidth <= 1366)
+            {
+                return 0.85;
+            }
+            return 1.0;
+        }
+
+        private static void SaveZoomFactor(double factor)
+        {
+            try
+            {
+                string file = GetSettingsFilePath();
+                var dict = new System.Collections.Generic.Dictionary<string, object>
+                {
+                    ["zoomFactor"] = Math.Round(factor, 2)
+                };
+                File.WriteAllText(file, JsonSerializer.Serialize(dict));
+            }
+            catch {}
+        }
+
+        private void ComponentDispatcher_ThreadPreprocessMessage(ref MSG msg, ref bool handled)
+        {
+            const int WM_KEYDOWN = 0x0100;
+            if (msg.message == WM_KEYDOWN)
+            {
+                bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+                if (ctrl)
+                {
+                    int vk = (int)msg.wParam;
+                    // VK_OEM_MINUS (189) or VK_SUBTRACT (109)
+                    if (vk == 0xBD || vk == 0x6D)
+                    {
+                        MenuZoomOut_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                    // VK_OEM_PLUS (187) or VK_ADD (107)
+                    else if (vk == 0xBB || vk == 0x6B)
+                    {
+                        MenuZoomIn_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                    // '0' (48) or VK_NUMPAD0 (96)
+                    else if (vk == 0x30 || vk == 0x60)
+                    {
+                        MenuZoomReset_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                    // 'I' (73)
+                    else if (vk == 0x49)
+                    {
+                        MenuInjectPrompt_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                    // 'N' (78)
+                    else if (vk == 0x4E)
+                    {
+                        MenuNewChat_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                    // 'R' (82)
+                    else if (vk == 0x52)
+                    {
+                        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+                            MenuForceReload_Click(this, new RoutedEventArgs());
+                        else
+                            MenuReload_Click(this, new RoutedEventArgs());
+                        handled = true;
+                    }
+                }
+            }
         }
 
         private void MenuExit_Click(object sender, RoutedEventArgs e)
@@ -643,24 +803,6 @@ namespace DeepSeek
         private void MenuGitHub_Click(object sender, RoutedEventArgs e)
         {
             Process.Start(new ProcessStartInfo("https://github.com/moxiuren/deepseek-mac") { UseShellExecute = true });
-        }
-
-        private void Window_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (Keyboard.Modifiers == ModifierKeys.Control)
-            {
-                if (e.Key == Key.N) { MenuNewChat_Click(sender, e); e.Handled = true; }
-                else if (e.Key == Key.I) { MenuInjectPrompt_Click(sender, e); e.Handled = true; }
-                else if (e.Key == Key.R)
-                {
-                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) MenuForceReload_Click(sender, e);
-                    else MenuReload_Click(sender, e);
-                    e.Handled = true;
-                }
-                else if (e.Key == Key.OemPlus || e.Key == Key.Add) { MenuZoomIn_Click(sender, e); e.Handled = true; }
-                else if (e.Key == Key.OemMinus || e.Key == Key.Subtract) { MenuZoomOut_Click(sender, e); e.Handled = true; }
-                else if (e.Key == Key.D0 || e.Key == Key.NumPad0) { MenuZoomReset_Click(sender, e); e.Handled = true; }
-            }
         }
     }
 }
