@@ -1,0 +1,9 @@
+#!/bin/bash
+FILE="$1"
+PROMPT="${2:-相关文件已作为附件挂载，请直接阅读分析。}"
+if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+    echo "错误: 请指定存在的文件路径，例如: agent-attach /path/to/file.json"
+    exit 1
+fi
+FULL_PATH="$(cd "$(dirname "$FILE")" && pwd)/$(basename "$FILE")"
+echo "[[AGENT_ATTACH_FILE:$FULL_PATH:$PROMPT]]"

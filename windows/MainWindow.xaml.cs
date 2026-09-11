@@ -127,10 +127,73 @@ namespace DeepSeek
                         _ = ExecuteLocalCommandAsync(id, cmd);
                     }
                 }
+                else if (action == "write_file")
+                {
+                    string path = root.TryGetProperty("path", out var p) ? p.GetString() ?? "" : "";
+                    string content = root.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+                    string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(path) && !string.IsNullOrEmpty(id))
+                    {
+                        _ = HandleFileWriteAsync(id, path, content);
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Trace.WriteLine($"[WebMessage Parse Error]: {ex.Message}");
+            }
+        }
+
+        private async Task HandleFileWriteAsync(string id, string path, string content)
+        {
+            try
+            {
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
+                string workingDir = Directory.Exists(projectsDir) ? projectsDir : userProfile;
+
+                string resolvedPath = path;
+                if (resolvedPath.StartsWith("~"))
+                {
+                    resolvedPath = Path.Combine(userProfile, resolvedPath.TrimStart('~', '/', '\\'));
+                }
+                else if (!Path.IsPathRooted(resolvedPath))
+                {
+                    resolvedPath = Path.Combine(workingDir, resolvedPath);
+                }
+
+                string dir = Path.GetDirectoryName(resolvedPath) ?? workingDir;
+                Directory.CreateDirectory(dir);
+
+                await File.WriteAllTextAsync(resolvedPath, content, Encoding.UTF8);
+
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var payload = new
+                    {
+                        id = id,
+                        exitCode = 0,
+                        output = $"文件已成功直接落盘写入：{resolvedPath}（共 {Encoding.UTF8.GetByteCount(content)} 字节）。"
+                    };
+                    string json = JsonSerializer.Serialize(payload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    var payload = new
+                    {
+                        id = id,
+                        exitCode = 1,
+                        output = $"文件写入失败: {ex.Message} (路径: {path})"
+                    };
+                    string json = JsonSerializer.Serialize(payload);
+                    string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                    await webView.CoreWebView2.ExecuteScriptAsync(js);
+                });
             }
         }
 
@@ -211,6 +274,72 @@ namespace DeepSeek
                     output = "(命令执行完毕，无终端文字输出)";
                 }
 
+                // 1. Check for explicit attach directive: [[AGENT_ATTACH_FILE:filepath:prompt]]
+                var match = System.Text.RegularExpressions.Regex.Match(output, @"\[\[AGENT_ATTACH_FILE:(.+?)\]\]");
+                if (match.Success)
+                {
+                    string inner = match.Groups[1].Value;
+                    string[] parts = inner.Split(new[] { ':' }, 2);
+                    string filePath = parts[0].Trim();
+                    string prompt = parts.Length > 1 ? parts[1].Trim() : "";
+
+                    filePath = Environment.ExpandEnvironmentVariables(filePath);
+                    if (File.Exists(filePath))
+                    {
+                        byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
+                        string b64 = Convert.ToBase64String(fileBytes);
+                        string filename = Path.GetFileName(filePath);
+                        string mime = GetMimeType(Path.GetExtension(filePath));
+
+                        await Dispatcher.InvokeAsync(async () =>
+                        {
+                            var attachPayload = new
+                            {
+                                id = id,
+                                exitCode = exitCode,
+                                isAttachment = true,
+                                filename = filename,
+                                mimeType = mime,
+                                base64Data = b64,
+                                prompt = prompt
+                            };
+                            string json = JsonSerializer.Serialize(attachPayload);
+                            string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                            await webView.CoreWebView2.ExecuteScriptAsync(js);
+                        });
+                        return;
+                    }
+                }
+
+                // 2. Check for oversized terminal output (> 6000 chars) -> auto package as attachment!
+                if (output.Length > 6000)
+                {
+                    string tempFile = Path.Combine(Path.GetTempPath(), $"agent_output_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.txt");
+                    await File.WriteAllTextAsync(tempFile, output, Encoding.UTF8);
+                    byte[] fileBytes = await File.ReadAllBytesAsync(tempFile);
+                    string b64 = Convert.ToBase64String(fileBytes);
+                    string filename = Path.GetFileName(tempFile);
+                    string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
+
+                    await Dispatcher.InvokeAsync(async () =>
+                    {
+                        var attachPayload = new
+                        {
+                            id = id,
+                            exitCode = exitCode,
+                            isAttachment = true,
+                            filename = filename,
+                            mimeType = "text/plain",
+                            base64Data = b64,
+                            prompt = prompt
+                        };
+                        string json = JsonSerializer.Serialize(attachPayload);
+                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
+                        await webView.CoreWebView2.ExecuteScriptAsync(js);
+                    });
+                    return;
+                }
+
                 // Smart truncation: keep first 4000 and last 4000 characters
                 int maxChars = 8000;
                 if (output.Length > maxChars)
@@ -250,6 +379,24 @@ namespace DeepSeek
                     Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
                 }
             });
+        }
+
+        private static string GetMimeType(string ext)
+        {
+            return ext.ToLowerInvariant() switch
+            {
+                ".png" => "image/png",
+                ".jpg" or ".jpeg" => "image/jpeg",
+                ".webp" => "image/webp",
+                ".gif" => "image/gif",
+                ".svg" => "image/svg+xml",
+                ".pdf" => "application/pdf",
+                ".json" => "application/json",
+                ".csv" => "text/csv",
+                ".html" or ".htm" => "text/html",
+                ".xml" => "application/xml",
+                _ => "text/plain"
+            };
         }
 
         private void CoreWebView2_NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)

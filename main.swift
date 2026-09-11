@@ -82,6 +82,24 @@ class DeepSeekAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
     private func setupDumpTimer() {
         dumpTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
             guard let self = self else { return }
+            if FileManager.default.fileExists(atPath: "/tmp/eval.js") {
+                if let code = try? String(contentsOfFile: "/tmp/eval.js", encoding: .utf8) {
+                    try? FileManager.default.removeItem(atPath: "/tmp/eval.js")
+                    self.webView.evaluateJavaScript(code) { (res, err) in
+                        let output: String
+                        if let err = err {
+                            output = "[ERROR]: \(err)"
+                        } else if let res = res {
+                            output = "\(res)"
+                        } else {
+                            output = "(nil)"
+                        }
+                        try? output.write(toFile: "/tmp/eval_output.txt", atomically: true, encoding: .utf8)
+                        print("[Native Bridge] Executed /tmp/eval.js, wrote output to /tmp/eval_output.txt")
+                        fflush(stdout)
+                    }
+                }
+            }
             if FileManager.default.fileExists(atPath: "/tmp/dump_chat.trigger") {
                 try? FileManager.default.removeItem(atPath: "/tmp/dump_chat.trigger")
                 let js = "window.__agentBridge ? window.__agentBridge.dumpConversation() : '';"
@@ -117,6 +135,12 @@ class DeepSeekAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
             let id = dict["id"] as? String ?? UUID().uuidString
             handleCommandExecution(command: command, id: id)
 
+        case "write_file":
+            let path = dict["path"] as? String ?? ""
+            let content = dict["content"] as? String ?? ""
+            let id = dict["id"] as? String ?? UUID().uuidString
+            handleFileWrite(path: path, content: content, id: id)
+
         case "getWorkDir":
             let js = "window.__agentBridge && window.__agentBridge.setWorkDir(`\(workDirectory)`);"
             webView.evaluateJavaScript(js, completionHandler: nil)
@@ -136,6 +160,47 @@ class DeepSeekAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
 
         default:
             break
+        }
+    }
+
+    // MARK: - Native Direct File Write
+    private func handleFileWrite(path: String, content: String, id: String) {
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            self.feedResultBackToWeb(id: id, exitCode: 1, output: "错误: 文件路径为空")
+            return
+        }
+
+        print("[Native Bridge] >>> WRITING FILE (ID: \(id)) to: \(path) (Length: \(content.count))")
+        fflush(stdout)
+
+        let resolvedURL: URL
+        let expanded = (path as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            resolvedURL = URL(fileURLWithPath: expanded)
+        } else {
+            resolvedURL = URL(fileURLWithPath: self.workDirectory).appendingPathComponent(path)
+        }
+
+        let parentDir = resolvedURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            try content.write(to: resolvedURL, atomically: true, encoding: .utf8)
+            let bytesCount = content.utf8.count
+            print("[Native Bridge] <<< FILE WRITTEN SUCCESSFULLY: \(resolvedURL.path) (\(bytesCount) bytes)")
+            fflush(stdout)
+
+            DispatchQueue.main.async {
+                let successMsg = "文件已成功直接落盘写入：\(resolvedURL.path)（共 \(bytesCount) 字节）。"
+                self.feedResultBackToWeb(id: id, exitCode: 0, output: successMsg)
+            }
+        } catch {
+            print("[Native Bridge] !!! FILE WRITE FAILED: \(error)")
+            fflush(stdout)
+
+            DispatchQueue.main.async {
+                let failMsg = "文件写入失败: \(error.localizedDescription) (路径: \(resolvedURL.path))"
+                self.feedResultBackToWeb(id: id, exitCode: 1, output: failMsg)
+            }
         }
     }
 
@@ -208,6 +273,52 @@ class DeepSeekAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
                     result = "(命令执行完毕，无终端文字输出)"
                 }
 
+                // 1. Check for explicit attach directive: [[AGENT_ATTACH_FILE:filepath:prompt]]
+                if let attachRange = result.range(of: "\\[\\[AGENT_ATTACH_FILE:(.+?)\\]\\]", options: .regularExpression) {
+                    let matchedStr = String(result[attachRange])
+                    let inner = matchedStr.dropFirst(20).dropLast(2)
+                    let parts = inner.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+                    let filePath = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let prompt = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                    
+                    let fileURL = URL(fileURLWithPath: (filePath as NSString).expandingTildeInPath)
+                    if FileManager.default.fileExists(atPath: fileURL.path),
+                       let fileData = try? Data(contentsOf: fileURL) {
+                        let filename = fileURL.lastPathComponent
+                        let mimeType = self.mimeType(for: fileURL.pathExtension)
+                        let b64 = fileData.base64EncodedString()
+                        
+                        print("[Native Bridge] <<< ATTACHING FILE: \(filename) (\(fileData.count) bytes, MIME: \(mimeType))")
+                        fflush(stdout)
+                        
+                        DispatchQueue.main.async {
+                            self.isExecuting = false
+                            self.feedAttachmentBackToWeb(id: id, exitCode: exitCode, filename: filename, mimeType: mimeType, base64: b64, prompt: prompt)
+                        }
+                        return
+                    }
+                }
+
+                // 2. Check for oversized terminal output (> 6000 chars) -> auto package as attachment!
+                if result.count > 6000 {
+                    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+                    let tempFile = tempDir.appendingPathComponent("agent_output_\(Int(Date().timeIntervalSince1970)).txt")
+                    if (try? result.write(to: tempFile, atomically: true, encoding: .utf8)) != nil,
+                       let fileData = try? Data(contentsOf: tempFile) {
+                        let b64 = fileData.base64EncodedString()
+                        let prompt = "终端输出内容较长（共 \(result.count) 字符），已自动打包为附件 \(tempFile.lastPathComponent) 供你直接阅读分析。"
+                        
+                        print("[Native Bridge] <<< AUTO-PACKAGING OVERSIZED OUTPUT AS ATTACHMENT: \(tempFile.lastPathComponent)")
+                        fflush(stdout)
+                        
+                        DispatchQueue.main.async {
+                            self.isExecuting = false
+                            self.feedAttachmentBackToWeb(id: id, exitCode: exitCode, filename: tempFile.lastPathComponent, mimeType: "text/plain", base64: b64, prompt: prompt)
+                        }
+                        return
+                    }
+                }
+
                 let maxChars = 8000
                 if result.count > maxChars {
                     let prefix = result.prefix(4000)
@@ -230,6 +341,48 @@ class DeepSeekAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
                     self.feedResultBackToWeb(id: id, exitCode: -1, output: "执行失败: \(error.localizedDescription)")
                 }
             }
+        }
+    }
+
+    private func feedAttachmentBackToWeb(id: String, exitCode: Int32, filename: String, mimeType: String, base64: String, prompt: String) {
+        let jsonOutput: [String: Any] = [
+            "id": id,
+            "exitCode": exitCode,
+            "isAttachment": true,
+            "filename": filename,
+            "mimeType": mimeType,
+            "base64Data": base64,
+            "prompt": prompt
+        ]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonOutput, options: []),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return
+        }
+
+        let js = "window.__agentBridge && window.__agentBridge.onCommandResult(\(jsonString));"
+        webView.evaluateJavaScript(js) { (res, err) in
+            if let err = err {
+                print("[Native Bridge] Feed attachment JS error: \(err)")
+            } else {
+                print("[Native Bridge] Fed attachment \(filename) to chat successfully.")
+            }
+            fflush(stdout)
+        }
+    }
+
+    private func mimeType(for ext: String) -> String {
+        switch ext.lowercased() {
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "webp": return "image/webp"
+        case "gif": return "image/gif"
+        case "svg": return "image/svg+xml"
+        case "pdf": return "application/pdf"
+        case "json": return "application/json"
+        case "csv": return "text/csv"
+        case "html", "htm": return "text/html"
+        case "xml": return "application/xml"
+        default: return "text/plain"
         }
     }
 

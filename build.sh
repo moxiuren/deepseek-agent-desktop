@@ -36,4 +36,10 @@ echo "==> 6. 安装到 /Applications..."
 rm -rf "/Applications/DeepSeek.app"
 cp -R "$APP_BUNDLE" "/Applications/DeepSeek.app"
 
+echo "==> 7. 安装辅助 CLI (agent-screenshot, agent-attach)..."
+mkdir -p "$HOME/.local/bin"
+cp scripts/agent-screenshot "$HOME/.local/bin/agent-screenshot" 2>/dev/null || true
+cp scripts/agent-attach "$HOME/.local/bin/agent-attach" 2>/dev/null || true
+chmod +x "$HOME/.local/bin/agent-screenshot" "$HOME/.local/bin/agent-attach" 2>/dev/null || true
+
 echo "==> 构建成功！应用已安装到 /Applications/DeepSeek.app"

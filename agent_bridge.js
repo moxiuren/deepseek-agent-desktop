@@ -71,6 +71,30 @@ ${exampleCmd}
 2. 本地系统会自动在终端执行该命令，并将真实的退出码和输出结果作为下一轮消息直接反馈给你；
 3. 收到真实反馈后，你根据结果进行下一阶段思考与决策（继续输出 \`local_cmd\` 或回答用户）；
 4. 所有任务最终完成时，无需输出 \`local_cmd\`，直接给出最终总结与解答。
+
+【文件直接落盘写文件协议 (免除任何 Shell 转义与拼接)】：
+当你需要创建、编写或修改一个文件时，无需使用 cat 或 echo 命令，直接输出带有目标路径的代码块：
+\`\`\`write_file:相对或绝对文件路径
+你的完整代码内容（原汁原味，零转义损坏）
+\`\`\`
+或者在代码块首行注明文件路径：
+\`\`\`python
+# file: 相对或绝对文件路径
+你的完整代码内容
+\`\`\`
+本地系统会自动递归创建父目录并将代码原子落盘写入指定位置！若写完需运行测试，紧随其后输出 \`\`\`local_cmd 代码块即可。
+
+【视觉感知与附件扩展能力】：
+- **截取桌面屏幕视觉**：若需查看当前桌面、GUI 窗口布局、网页渲染或排版效果，直接输出：
+\`\`\`local_cmd
+agent-screenshot
+\`\`\`
+系统将自动抓取当前屏幕并作为图片附件挂载发送给你，下一轮你将直接获得完整视觉图像！
+- **挂载任意大文件**：若需阅读大文件（支持最大 100MB），输出：
+\`\`\`local_cmd
+agent-attach 文件路径 "说明或提示"
+\`\`\`
+- **长输出防爆**：终端命令的超长输出（> 6KB）系统会自动为你打包为附件上传，不会撑爆输入框与上下文。
 请确认收到，并等待用户指令。`;
 
     let autoExecute = true;
@@ -206,25 +230,178 @@ ${exampleCmd}
         return lines.join('\n').trim();
     }
 
+    // Direct File Output Protocol Helpers
+    function isValidFilePath(p) {
+        if (!p || typeof p !== 'string') return false;
+        p = p.trim().replace(/^["'`]|["'`]$/g, '').replace(/-->|\*\/$/, '').trim();
+        if (!p || p.length < 2) return false;
+        if (p.includes(' ') || p.includes('\t') || p.includes('\n')) return false;
+
+        const hasSlash = p.includes('/') || p.includes('\\');
+        const hasExt = /\.[a-zA-Z0-9_-]{1,10}$/.test(p);
+        const isSpecialFile = /^(?:Makefile|Dockerfile|Gemfile|Vagrantfile|Procfile|\.gitignore|\.env.*|\.bashrc|\.zshrc)$/i.test(p);
+
+        return hasSlash || hasExt || isSpecialFile;
+    }
+
+    function detectFileWriteBlock(blockNode) {
+        if (!blockNode) return null;
+
+        const codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
+        const fullText = (blockNode.innerText || blockNode.textContent || '').trim();
+        const banner = blockNode.querySelector('[class*="banner"], [class*="infostring"], [class*="header"], [class*="lang"]');
+        const bannerText = (banner ? (banner.innerText || banner.textContent || '') : '').trim();
+        const codeClass = codeEl ? (codeEl.className || '') : '';
+
+        let filePath = null;
+        let isExplicitWriteFile = false;
+
+        // 1. Explicit write_file: in banner or header
+        let m = bannerText.match(/(?:write_file|write-file):\s*([^\s\n\r]+)/i);
+        if (m && m[1]) {
+            filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
+            isExplicitWriteFile = true;
+        }
+
+        // 2. Explicit write_file: in code class (e.g. language-write_file:path)
+        if (!filePath && codeClass) {
+            m = codeClass.match(/language-(?:write_file|write-file):([^\s]+)/i);
+            if (m && m[1]) {
+                filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
+                isExplicitWriteFile = true;
+            }
+        }
+
+        // 3. Explicit write_file: in fullText (first line or standalone token)
+        if (!filePath) {
+            m = fullText.match(/write_file:\s*([^\s\n\r]+)/i);
+            if (m && m[1]) {
+                filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
+                isExplicitWriteFile = true;
+            }
+        }
+
+        // 4. file: in banner (e.g. ```file:path/to/file)
+        if (!filePath) {
+            m = bannerText.match(/^file:\s*([^\s\n\r]+)/i);
+            if (m && m[1] && isValidFilePath(m[1])) {
+                filePath = m[1].trim().replace(/^["'`]|["'`]$/g, '');
+            }
+        }
+
+        // 5. Check first non-empty line of code block for # file: /path or // file: /path
+        const rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : fullText;
+        const lines = (rawText || '').split(/\r?\n/);
+        let firstLineIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].trim()) {
+                firstLineIdx = i;
+                break;
+            }
+        }
+
+        let isCommentDirective = false;
+        if (firstLineIdx !== -1) {
+            const line = lines[firstLineIdx].trim();
+            const commentMatch = line.match(/^(?:#|\/\/|\/\*|--|;|<!--)\s*(?:file|filepath|path):\s*([^\s*]+)/i);
+            if (commentMatch && commentMatch[1]) {
+                const cand = commentMatch[1].trim().replace(/^["'`]|["'`]$/g, '').replace(/-->|\*\/$/, '').trim();
+                if (isValidFilePath(cand)) {
+                    if (!filePath) {
+                        filePath = cand;
+                    }
+                    isCommentDirective = true;
+                }
+            }
+        }
+
+        if (!filePath) return null;
+
+        // Clean any leftover quotes or brackets
+        filePath = filePath.replace(/^["'`]|["'`]$/g, '').replace(/-->|\*\/$/, '').trim();
+        if (!filePath) return null;
+
+        return {
+            path: filePath,
+            isCommentDirective,
+            firstLineIdx,
+            isExplicitWriteFile
+        };
+    }
+
+    function extractFileContent(blockNode, fileInfo) {
+        let codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
+        let rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : (blockNode.innerText || blockNode.textContent);
+        let lines = (rawText || '').split(/\r?\n/);
+
+        // If block has comment directive on first non-empty line, remove that line
+        if (fileInfo && fileInfo.isCommentDirective && fileInfo.firstLineIdx !== -1) {
+            lines.splice(fileInfo.firstLineIdx, 1);
+        } else {
+            // Check if first non-empty line starts with write_file: or file: (in case parser put fence tag into code)
+            let firstIdx = lines.findIndex(l => l.trim().length > 0);
+            if (firstIdx !== -1 && lines[firstIdx].trim().match(/^(?:write_file|write-file|file):\s*/i)) {
+                lines.splice(firstIdx, 1);
+            }
+        }
+
+        // If fallback to blockNode (no codeEl), strip UI artifacts like 'Copy' or 'Download'
+        if (!codeEl) {
+            lines = lines.filter(line => {
+                const t = line.trim();
+                if (!t) return true;
+                if (t === 'Copy' || t === 'Download' || t === '复制' || t === '下载') return false;
+                if (t.startsWith('write_file:') || t.startsWith('file:')) return false;
+                return true;
+            });
+        }
+
+        let content = lines.join('\n');
+        // Clean single leading newline if created by splicing first line
+        content = content.replace(/^\r?\n/, '');
+        return content;
+    }
+
     // 2. Render Tool Call Card UI (Clean Terminal output inside DeepSeek's side)
-    function renderToolCallCard(targetNode, command, onExecute) {
+    function renderToolCallCard(targetNode, command, onExecute, type = 'cmd', meta = {}) {
         const cardId = 'tool-card-' + Math.random().toString(36).substring(2, 9);
         const card = document.createElement('div');
         card.id = cardId;
         card.className = 'agent-tool-card';
+        const isFile = (type === 'write_file');
         card.style.cssText = `
             margin: 14px 0;
-            border: 1.5px solid #3b82f6;
+            border: 1.5px solid ${isFile ? '#0d9488' : '#3b82f6'};
             border-radius: 12px;
             overflow: hidden;
             background: #ffffff;
-            box-shadow: 0 4px 18px rgba(59, 130, 246, 0.14);
+            box-shadow: 0 4px 18px rgba(${isFile ? '13, 148, 136' : '59, 130, 246'}, 0.14);
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
         `;
 
+        let icon = '⚡️';
+        let headerTitle = '本地工具调用 (TOOL CALL)';
+        let headerGradient = 'linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)';
+        let headerBorder = '#bfdbfe';
+        let headerTitleColor = '#1e40af';
         let tagLabel = 'LOCAL SHELL';
         let tagBg = '#2563eb';
-        if (command.includes('agy') || command.includes('agy-run')) {
+        let subTextPrefix = '$ ';
+        let subTextColor = '#f8fafc';
+        let subTextContent = command;
+
+        if (isFile) {
+            icon = '📝';
+            headerTitle = '本地文件直接写入 (DIRECT FILE WRITE)';
+            headerGradient = 'linear-gradient(135deg, #f0fdfa 0%, #ccfbf1 100%)';
+            headerBorder = '#99f6e4';
+            headerTitleColor = '#0f766e';
+            tagLabel = meta.path || 'FILE WRITE';
+            tagBg = '#0d9488';
+            subTextPrefix = 'TARGET: ';
+            subTextColor = '#2dd4bf';
+            subTextContent = meta.path || '';
+        } else if (command.includes('agy') || command.includes('agy-run')) {
             tagLabel = 'GEMINI 3.8 FLASH (LOW)';
             tagBg = '#7c3aed';
         } else if (command.includes('mimo')) {
@@ -233,27 +410,27 @@ ${exampleCmd}
         }
 
         card.innerHTML = `
-            <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-bottom: 1px solid #bfdbfe;">
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: ${headerGradient}; border-bottom: 1px solid ${headerBorder};">
                 <div style="display: flex; align-items: center; gap: 8px;">
-                    <span style="font-size: 16px;">⚡️</span>
-                    <span style="font-weight: 700; font-size: 12px; color: #1e40af; letter-spacing: 0.3px;">本地工具调用 (TOOL CALL)</span>
+                    <span style="font-size: 16px;">${icon}</span>
+                    <span style="font-weight: 700; font-size: 12px; color: ${headerTitleColor}; letter-spacing: 0.3px;">${headerTitle}</span>
                     <span style="background: ${tagBg}; color: #ffffff; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 5px; font-family: ui-monospace, monospace;">${tagLabel}</span>
                 </div>
                 <div style="display: flex; align-items: center; gap: 10px;">
-                    <div id="${cardId}-status" style="display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #d97706;">
-                        <span class="spinner" style="display: inline-block; width: 10px; height: 10px; border: 2px solid #d97706; border-top-color: transparent; border-radius: 50%; animation: agent-spin 0.8s linear infinite;"></span>
-                        <span class="status-msg">准备执行...</span>
+                    <div id="${cardId}-status" style="display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: ${isFile ? '#0d9488' : '#d97706'};">
+                        <span class="spinner" style="display: inline-block; width: 10px; height: 10px; border: 2px solid ${isFile ? '#0d9488' : '#d97706'}; border-top-color: transparent; border-radius: 50%; animation: agent-spin 0.8s linear infinite;"></span>
+                        <span class="status-msg">${isFile ? '准备写入...' : '准备执行...'}</span>
                     </div>
-                    <button id="${cardId}-btn" style="background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: 500; cursor: pointer; transition: background 0.2s;">
-                        ▶ 重新运行
+                    <button id="${cardId}-btn" style="background: ${isFile ? '#0d9488' : '#2563eb'}; color: #fff; border: none; border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: 500; cursor: pointer; transition: background 0.2s;">
+                        ▶ ${isFile ? '重新写入' : '重新运行'}
                     </button>
                 </div>
             </div>
             <div style="padding: 10px 14px; background: #0f172a; color: #38bdf8; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12.5px; line-height: 1.5; border-bottom: 1px solid #1e293b; overflow-x: auto;">
-                <span style="color: #64748b; user-select: none;">$ </span><span style="color: #f8fafc; font-weight: 500;">${escapeHtml(command)}</span>
+                <span style="color: #64748b; user-select: none;">${subTextPrefix}</span><span style="color: ${subTextColor}; font-weight: 500;">${escapeHtml(subTextContent)}</span>
             </div>
             <div id="${cardId}-output-box" style="padding: 10px 14px; background: #090d16; color: #10b981; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; line-height: 1.5; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;">
-                <span style="color: #64748b; font-style: italic;">[等待终端执行输出...]</span>
+                <span style="color: #64748b; font-style: italic;">[${isFile ? '等待文件写入完成...' : '等待终端执行输出...'}]</span>
             </div>
             <div id="${cardId}-pacing-bar" style="display: none; padding: 6px 14px; background: #f0fdf4; border-top: 1px solid #bbf7d0; font-size: 11px; color: #15803d; align-items: center; justify-content: space-between;">
                 <span id="${cardId}-pacing-text">⏱ 防频控保护：将在 3 秒后自动同步给 DeepSeek...</span>
@@ -267,6 +444,9 @@ ${exampleCmd}
         const controller = {
             cardId,
             command,
+            type,
+            isFile,
+            meta,
             setStatus: (msg, color, isSpinning) => {
                 const st = document.getElementById(`${cardId}-status`);
                 if (st) {
@@ -302,7 +482,13 @@ ${exampleCmd}
 
         const btn = document.getElementById(`${cardId}-btn`);
         btn.addEventListener('click', () => {
-            executeCommand(command, controller);
+            if (onExecute) {
+                onExecute(command, controller);
+            } else if (isFile) {
+                executeFileWrite(meta.path, command, controller);
+            } else {
+                executeCommand(command, controller);
+            }
         });
 
         cardControllers[cardId] = controller;
@@ -322,28 +508,42 @@ ${exampleCmd}
             const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
             if (parent.dataset.agentProcessed) continue;
 
+            const fileInfo = detectFileWriteBlock(parent);
+            const isFileWrite = !!fileInfo;
+
             const fullText = (parent.innerText || parent.textContent || '').trim();
-            const isLocalCmd = fullText.includes('local_cmd') ||
+            const isLocalCmd = !isFileWrite && (
+                               fullText.includes('local_cmd') ||
                                el.className.includes('local_cmd') ||
                                fullText.includes('agy-run') ||
                                fullText.includes('agy --model') ||
-                               fullText.includes('opencode run');
+                               fullText.includes('opencode run'));
 
-            if (!isLocalCmd) continue;
+            if (!isLocalCmd && !isFileWrite) continue;
 
-            const cleanCmd = extractPureCommand(parent);
-            if (!cleanCmd || cleanCmd.length < 2) continue;
+            let cleanCmd = "";
+            let fileContent = "";
+            let trackKey = "";
+
+            if (isFileWrite) {
+                fileContent = extractFileContent(parent, fileInfo);
+                trackKey = fileInfo.path + "::" + fileContent;
+            } else {
+                cleanCmd = extractPureCommand(parent);
+                if (!cleanCmd || cleanCmd.length < 2) continue;
+                trackKey = cleanCmd;
+            }
 
             // Debounce
             let tracker = blockWatchMap.get(parent);
             if (!tracker) {
-                tracker = { text: cleanCmd, lastChange: now };
+                tracker = { text: trackKey, lastChange: now };
                 blockWatchMap.set(parent, tracker);
                 continue;
             }
 
-            if (tracker.text !== cleanCmd) {
-                tracker.text = cleanCmd;
+            if (tracker.text !== trackKey) {
+                tracker.text = trackKey;
                 tracker.lastChange = now;
                 continue;
             }
@@ -352,7 +552,7 @@ ${exampleCmd}
                 continue;
             }
 
-            if (!isQuoteBalanced(cleanCmd)) {
+            if (!isFileWrite && !isQuoteBalanced(cleanCmd)) {
                 console.log("[Agent Bridge] Waiting for closed quotes:\n", cleanCmd);
                 continue;
             }
@@ -361,20 +561,33 @@ ${exampleCmd}
             parent.dataset.agentProcessed = "true";
             blockWatchMap.delete(parent);
 
-            console.log("[Agent Bridge] Complete Tool Call Detected:\n", cleanCmd);
+            if (isFileWrite) {
+                console.log(`[Agent Bridge] Complete File Write Detected. Target: ${fileInfo.path} (${fileContent.length} chars)`);
 
-            const controller = renderToolCallCard(parent, cleanCmd, (cmd, ctrl) => {
-                executeCommand(cmd, ctrl);
-            });
+                const controller = renderToolCallCard(parent, fileContent, (content, ctrl) => {
+                    executeFileWrite(fileInfo.path, content, ctrl);
+                }, 'write_file', { path: fileInfo.path, content: fileContent });
 
-            if (autoExecute && !isExecutingNow) {
-                executeCommand(cleanCmd, controller);
-                break;
+                if (autoExecute && !isExecutingNow) {
+                    executeFileWrite(fileInfo.path, fileContent, controller);
+                    break;
+                }
+            } else {
+                console.log("[Agent Bridge] Complete Tool Call Detected:\n", cleanCmd);
+
+                const controller = renderToolCallCard(parent, cleanCmd, (cmd, ctrl) => {
+                    executeCommand(cmd, ctrl);
+                }, 'cmd');
+
+                if (autoExecute && !isExecutingNow) {
+                    executeCommand(cleanCmd, controller);
+                    break;
+                }
             }
         }
     }
 
-    // 4. Execute Command via Native Swift
+    // 4. Execute Command via Native Swift / Host
     function executeCommand(command, controller) {
         if (isExecutingNow) return;
 
@@ -393,6 +606,26 @@ ${exampleCmd}
         });
     }
 
+    // 4b. Direct File Write via Native Host
+    function executeFileWrite(path, content, controller) {
+        if (isExecutingNow) return;
+
+        isExecutingNow = true;
+        controller.hidePacing();
+        controller.setStatus("正在写入本地文件...", "#0d9488", true);
+        controller.setOutput(`[正在将文件落盘至本地系统...]\n目标路径: ${path}\n文件大小: ${content.length} 字符`);
+        updateHUD("正在写入本地文件...", "#0d9488");
+
+        console.log(`[Agent Bridge] Dispatching file write to native host (Path: ${path}, ${content.length} chars)`);
+
+        sendToNative({
+            action: "write_file",
+            path: path,
+            content: content,
+            id: controller.cardId
+        });
+    }
+
     // 5. Hide / Collapse Ugly User Feedback Messages into Sleek Compact Badges!
     function collapseToolFeedbackBubbles() {
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -400,7 +633,7 @@ ${exampleCmd}
         const textNodes = [];
         while (node = walker.nextNode()) {
             const v = node.nodeValue || '';
-            if (v.includes('[Tool Call Result') || v.includes('【本地工具执行结果')) {
+            if (v.includes('[Tool Call') || v.includes('【本地工具执行结果')) {
                 textNodes.push(node);
             }
         }
@@ -477,6 +710,64 @@ ${exampleCmd}
         }
     }
 
+    // Helper: Convert Base64 string to a synthetic File object
+    function base64ToFile(b64Data, filename, mimeType) {
+        const sliceSize = 1024;
+        const byteCharacters = atob(b64Data);
+        const byteArrays = [];
+        for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
+            const slice = byteCharacters.slice(offset, offset + sliceSize);
+            const byteNumbers = new Array(slice.length);
+            for (let i = 0; i < slice.length; i++) {
+                byteNumbers[i] = slice.charCodeAt(i);
+            }
+            const byteArray = new Uint8Array(byteNumbers);
+            byteArrays.push(byteArray);
+        }
+        const blob = new Blob(byteArrays, { type: mimeType });
+        return new File([blob], filename, { type: mimeType });
+    }
+
+    // Helper: Inject synthetic File directly into DeepSeek React file input
+    function injectFileToChat(file) {
+        const input = document.querySelector('input[type="file"]');
+        if (!input) {
+            console.error("[Agent Bridge] No input[type=file] found!");
+            return false;
+        }
+        const propsKey = Object.keys(input).find(k => k.startsWith('__reactProps'));
+        const fn = input[propsKey]?.onChange;
+        if (!fn) {
+            console.error("[Agent Bridge] React onChange not found on input!");
+            return false;
+        }
+        try {
+            fn({
+                target: {
+                    files: [file],
+                    value: ''
+                }
+            });
+            console.log(`[Agent Bridge] Attached file: ${file.name} (${Math.round(file.size / 1024)} KB, ${file.type})`);
+            return true;
+        } catch(e) {
+            console.error("[Agent Bridge] Error triggering file upload:", e);
+            return false;
+        }
+    }
+
+    // Helper: Wait until DeepSeek web finishes uploading attachment to server
+    function waitForAttachmentReady(callback, maxWaitMs = 12000) {
+        const startTime = Date.now();
+        const timer = setInterval(() => {
+            const loadingEls = document.querySelectorAll('.ds-animated-size-item .ds-loading, .ds-animated-size-item [class*="loading"]');
+            if (loadingEls.length === 0 || (Date.now() - startTime > maxWaitMs)) {
+                clearInterval(timer);
+                callback();
+            }
+        }, 300);
+    }
+
     // 6. Handle Native Result + Polite Pacing
     window.__agentBridge = {
         injectSystemPrompt: function() {
@@ -494,24 +785,61 @@ ${exampleCmd}
             const cardId = data.id;
             const exitCode = data.exitCode;
             const output = data.output || "(执行完毕，无输出)";
+            const isAttachment = !!data.isAttachment;
 
-            console.log(`[Agent Bridge] Command finished (Exit: ${exitCode})`);
+            console.log(`[Agent Bridge] Command finished (Exit: ${exitCode}, isAttachment: ${isAttachment})`);
 
-            const controller = cardControllers[cardId];
-            if (controller) {
-                const isSuccess = (exitCode === 0);
-                controller.setStatus(isSuccess ? `✅ 执行成功 (退出码: 0)` : `❌ 执行异常 (退出码: ${exitCode})`, isSuccess ? "#10b981" : "#ef4444", false);
-                controller.setOutput(output, !isSuccess);
+            let fileObj = null;
+            if (isAttachment && data.base64Data) {
+                try {
+                    fileObj = base64ToFile(data.base64Data, data.filename || "attachment.txt", data.mimeType || "text/plain");
+                    injectFileToChat(fileObj);
+                } catch(e) {
+                    console.error("[Agent Bridge] Failed to process attachment:", e);
+                }
             }
 
-            // Streamlined, clean prompt that doesn't waste tokens
-            const feedback = `[Tool Call Result (Exit: ${exitCode})]:
+            const controller = cardControllers[cardId];
+            const isSuccess = (exitCode === 0);
+            const isFile = controller && (controller.isFile || controller.type === 'write_file');
+
+            if (controller) {
+                if (isFile) {
+                    controller.setStatus(isSuccess ? `✅ 写入成功` : `❌ 写入失败 (退出码: ${exitCode})`, isSuccess ? "#0d9488" : "#ef4444", false);
+                    controller.setOutput(output, !isSuccess);
+                } else if (isAttachment && fileObj) {
+                    const isImg = (data.mimeType || "").startsWith("image/");
+                    const title = isImg ? "📸 屏幕截图已挂载" : "📎 附件文件已挂载";
+                    controller.setStatus(`${title}: ${data.filename}`, "#10b981", false);
+                    controller.setOutput(`[${isImg ? "图片" : "文件"}已成功挂载至对话输入框]\n文件名: ${data.filename}\n大小: ${Math.round(fileObj.size / 1024)} KB\n类型: ${data.mimeType}\n\n正在通过 3s 节流安全通道自动发送...`);
+                } else {
+                    controller.setStatus(isSuccess ? `✅ 执行成功 (退出码: 0)` : `❌ 执行异常 (退出码: ${exitCode})`, isSuccess ? "#10b981" : "#ef4444", false);
+                    controller.setOutput(output, !isSuccess);
+                }
+            }
+
+            let feedback = "";
+            if (isFile) {
+                feedback = `[Tool Call: 本地文件直接写入结果 (Exit: ${exitCode})]:
+${output}
+
+请根据写入结果继续。若写完需运行测试，请输出 \`\`\`local_cmd 代码块；若还需写入其他文件请输出 \`\`\`write_file 代码块；若全部完成请给出最终解答。`;
+            } else if (isAttachment && fileObj) {
+                const isImg = (data.mimeType || "").startsWith("image/");
+                const desc = data.prompt || (isImg ? "屏幕截图已捕获，请查看附件图片进行分析与判断。" : "相关数据已作为附件挂载至输入框。");
+                feedback = `[Tool Call 附件就绪]: ${desc}
+（附件: ${data.filename}，大小: ${Math.round(fileObj.size / 1024)} KB）
+
+请阅读并分析上述附件内容，继续进行下一步判断或直接给出回答。`;
+            } else {
+                feedback = `[Tool Call Result (Exit: ${exitCode})]:
 \`\`\`
 ${output}
 \`\`\`
 请根据上述终端执行结果继续。若需继续执行命令请输出 \`\`\`local_cmd 代码块，若全部完成请给出最终解答。`;
+            }
 
-            let countdown = 3;
+            let countdown = isAttachment ? 4 : 3;
             if (controller) {
                 controller.showPacing(countdown, () => {
                     if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
@@ -521,15 +849,27 @@ ${output}
 
             function sendFeedbackNow() {
                 if (controller) controller.hidePacing();
-                updateHUD("同步执行结果给 DeepSeek...", "#2563eb");
-                injectPrompt(feedback, true);
-                setTimeout(() => {
-                    updateHUD("Tool Call 引擎就绪", "#10b981");
-                    collapseToolFeedbackBubbles();
-                }, 1500);
+                const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
+                updateHUD(hudMsg, "#2563eb");
+                
+                if (isAttachment) {
+                    waitForAttachmentReady(() => {
+                        injectPrompt(feedback, true);
+                        setTimeout(() => {
+                            updateHUD("Tool Call 引擎就绪", "#10b981");
+                            collapseToolFeedbackBubbles();
+                        }, 1500);
+                    });
+                } else {
+                    injectPrompt(feedback, true);
+                    setTimeout(() => {
+                        updateHUD("Tool Call 引擎就绪", "#10b981");
+                        collapseToolFeedbackBubbles();
+                    }, 1500);
+                }
             }
 
-            pendingFeedbackTimer = setTimeout(sendFeedbackNow, 3000);
+            pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
         }
     };
 
