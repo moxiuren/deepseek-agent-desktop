@@ -35,6 +35,11 @@ namespace DeepSeek
         //   create empty file %LOCALAPPDATA%\DeepSeek-Agent\diag.enable
         public static readonly bool DiagnosticsEnabled = CheckDiagnostics();
 
+        // Direct API Send (bypassing input box) is toggleable via:
+        //   set DEEPSEEK_DIRECT_SEND=1  (environment variable), or
+        //   create empty file %LOCALAPPDATA%\DeepSeek-Agent\direct_send.enable
+        public static readonly bool DirectSendEnabled = CheckDirectSend();
+
         private static bool CheckDiagnostics()
         {
             try
@@ -43,6 +48,20 @@ namespace DeepSeek
                 string flag = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "DeepSeek-Agent", "diag.enable");
+                if (File.Exists(flag)) return true;
+            }
+            catch {}
+            return false;
+        }
+
+        private static bool CheckDirectSend()
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable("DEEPSEEK_DIRECT_SEND") == "1") return true;
+                string flag = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DeepSeek-Agent", "direct_send.enable");
                 if (File.Exists(flag)) return true;
             }
             catch {}

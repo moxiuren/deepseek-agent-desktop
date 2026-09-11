@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
@@ -51,6 +52,7 @@ namespace DeepSeek
         // Session persists across commands (cwd, variables, $env:), commands stay serialized via _execGate.
         private Runspace? _runspace;
         private readonly object _poolLock = new();
+        private readonly DeepSeekApiClient _apiClient = new();
 
         private Runspace GetRunspace()
         {
@@ -158,6 +160,7 @@ namespace DeepSeek
             {
                 try { if (_llHookId != IntPtr.Zero) { UnhookWindowsHookEx(_llHookId); _llHookId = IntPtr.Zero; } } catch {}
                 try { lock (_poolLock) { _runspace?.Dispose(); _runspace = null; } } catch {}
+                try { _apiClient.Dispose(); } catch {}
             };
             App.Log("MainWindow.ctor exit");
         }
@@ -489,6 +492,32 @@ namespace DeepSeek
                     string resBody = root.TryGetProperty("resBody", out var rb) ? ((rb.GetString() ?? "").Replace("\r", " ").Replace("\n", " ")) : "";
                     if (resBody.Length > 2000) resBody = resBody.Substring(0, 2000) + "...[truncated]";
                     App.Log($"[APISNIFF] {side} {method} {url} status={status} ct={ct} bodyKind={bodyKind} {bodyPrev} hnames=[{hnames}] resBody={resBody}");
+
+                    // Track session and message IDs for direct API send
+                    try
+                    {
+                        if (url.Contains("/api/v0/chat/completion") && root.TryGetProperty("body", out var bElem) && bElem.ValueKind == JsonValueKind.Object && bElem.TryGetProperty("preview", out var rawPrev))
+                        {
+                            string raw = rawPrev.GetString() ?? "";
+                            if (raw.Contains("\"chat_session_id\""))
+                            {
+                                using var jd = JsonDocument.Parse(raw);
+                                if (jd.RootElement.TryGetProperty("chat_session_id", out var sid))
+                                    _apiClient.UpdateSessionState(sid.GetString(), null);
+                                if (jd.RootElement.TryGetProperty("parent_message_id", out var pid) && pid.ValueKind == JsonValueKind.Number)
+                                    _apiClient.UpdateSessionState(null, pid.GetInt32());
+                            }
+                        }
+                        if (bodyPrev.Contains("ds_chat_session_id") && bodyPrev.Contains("ds_chat_message_id"))
+                        {
+                            var matchSid = System.Text.RegularExpressions.Regex.Match(bodyPrev, @"\\""ds_chat_session_id\\"":\\""([^\\""]+)\\""");
+                            var matchMid = System.Text.RegularExpressions.Regex.Match(bodyPrev, @"\\""ds_chat_message_id\\"":(\d+)");
+                            string? sid = matchSid.Success ? matchSid.Groups[1].Value : null;
+                            int? mid = matchMid.Success && int.TryParse(matchMid.Groups[1].Value, out int mVal) ? mVal : null;
+                            _apiClient.UpdateSessionState(sid, mid);
+                        }
+                    }
+                    catch {}
                 }
                 else if (action == "execute")
                 {
@@ -1000,22 +1029,7 @@ namespace DeepSeek
                         string filename = Path.GetFileName(filePath);
                         string mime = GetMimeType(Path.GetExtension(filePath));
 
-                        await Dispatcher.InvokeAsync(async () =>
-                        {
-                            var attachPayload = new
-                            {
-                                id = id,
-                                exitCode = exitCode,
-                                isAttachment = true,
-                                filename = filename,
-                                mimeType = mime,
-                                base64Data = b64,
-                                prompt = prompt
-                            };
-                            string json = JsonSerializer.Serialize(attachPayload);
-                            string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
-                            await webView.CoreWebView2.ExecuteScriptAsync(js);
-                        });
+                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt);
                         return;
                     }
                 }
@@ -1030,22 +1044,7 @@ namespace DeepSeek
                     string filename = Path.GetFileName(tempFile);
                     string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
 
-                    await Dispatcher.InvokeAsync(async () =>
-                    {
-                        var attachPayload = new
-                        {
-                            id = id,
-                            exitCode = exitCode,
-                            isAttachment = true,
-                            filename = filename,
-                            mimeType = "text/plain",
-                            base64Data = b64,
-                            prompt = prompt
-                        };
-                        string json = JsonSerializer.Serialize(attachPayload);
-                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
-                        await webView.CoreWebView2.ExecuteScriptAsync(js);
-                    });
+                    await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt);
                     return;
                 }
 
@@ -1066,7 +1065,52 @@ namespace DeepSeek
                 App.Log($"[Execute] FAILED id={id} cmd-head={command.Substring(0, Math.Min(120, command.Length))} ex={ex}");
             }
 
-            // Feed result back to WebView2
+            // Feed result back (direct API send if enabled, otherwise fallback to web input box)
+            await FeedResultBackAsync(id, exitCode, output);
+            }
+            finally
+            {
+                LiveStreamCmdlet.Sink = null;
+                if (gateTaken) { try { _execGate.Release(); } catch {} }
+            }
+        }
+
+        private async Task FeedResultBackAsync(
+            string id,
+            int exitCode,
+            string output,
+            bool isAttachment = false,
+            string? filename = null,
+            string? mimeType = null,
+            string? base64Data = null,
+            string? prompt = null)
+        {
+            if (App.DirectSendEnabled)
+            {
+                try
+                {
+                    bool directSent = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt);
+                    if (directSent)
+                    {
+                        App.Log($"[DirectSend] Command {id} sent out-of-band directly to model.");
+                        await Dispatcher.InvokeAsync(async () =>
+                        {
+                            try
+                            {
+                                string notifyJs = $"window.__agentBridge && window.__agentBridge.onDirectSendSuccess && window.__agentBridge.onDirectSendSuccess('{id}');";
+                                await webView.CoreWebView2.ExecuteScriptAsync(notifyJs);
+                            }
+                            catch { }
+                        });
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[DirectSend] Exception: {ex.Message}, falling back to input box");
+                }
+            }
+
             await Dispatcher.InvokeAsync(async () =>
             {
                 try
@@ -1075,7 +1119,12 @@ namespace DeepSeek
                     {
                         id = id,
                         exitCode = exitCode,
-                        output = output
+                        output = output,
+                        isAttachment = isAttachment,
+                        filename = filename,
+                        mimeType = mimeType,
+                        base64Data = base64Data,
+                        prompt = prompt
                     };
                     string jsonString = JsonSerializer.Serialize(payload);
                     string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";
@@ -1086,12 +1135,66 @@ namespace DeepSeek
                     Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
                 }
             });
-            }
-            finally
+        }
+
+        private async Task<bool> TryDirectSendAsync(
+            string id,
+            int exitCode,
+            string output,
+            bool isAttachment,
+            string? filename,
+            string? mimeType,
+            string? base64Data,
+            string? prompt)
+        {
+            if (webView?.CoreWebView2 == null) return false;
+
+            string? token = await _apiClient.ExtractTokenAsync(webView.CoreWebView2);
+            if (string.IsNullOrEmpty(token))
             {
-                LiveStreamCmdlet.Sink = null;
-                if (gateTaken) { try { _execGate.Release(); } catch {} }
+                App.Log("[DirectSend] User token not available in localStorage");
+                return false;
             }
+
+            string sessionId = _apiClient.CurrentSessionId ?? "";
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(webView.Source?.ToString() ?? "", @"/a/chat/s/([a-f0-9\-]+)");
+                if (match.Success) sessionId = match.Groups[1].Value;
+            }
+
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                App.Log("[DirectSend] Current chat session ID not found");
+                return false;
+            }
+
+            int parentMsgId = _apiClient.LastMessageId ?? -1;
+            if (parentMsgId <= 0)
+            {
+                App.Log("[DirectSend] Last parent message ID not found");
+                return false;
+            }
+
+            List<string>? refFileIds = null;
+            if (isAttachment && !string.IsNullOrEmpty(base64Data))
+            {
+                byte[] fileBytes = Convert.FromBase64String(base64Data);
+                string fileId = await _apiClient.UploadFileDirectAsync(fileBytes, filename ?? "attachment.bin", mimeType ?? "application/octet-stream", token);
+                refFileIds = new List<string> { fileId };
+            }
+
+            string feedbackPrompt;
+            if (isAttachment)
+            {
+                feedbackPrompt = $"[Tool Call 附件就绪]: {prompt ?? "相关数据已作为附件挂载。"}\n（附件: {filename}）\n\n请阅读并分析上述附件内容，继续进行下一步判断或直接给出回答。";
+            }
+            else
+            {
+                feedbackPrompt = $"[Tool Call Result (Exit: {exitCode})]:\n```\n{output}\n```\n请根据上述终端执行结果继续。若需继续执行请输出 ```local_cmd 代码块，若全部完成请给出最终解答。";
+            }
+
+            return await _apiClient.SendCompletionDirectAsync(sessionId, parentMsgId, feedbackPrompt, refFileIds, token);
         }
 
         private static string GetMimeType(string ext)

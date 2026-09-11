@@ -1102,6 +1102,17 @@
                 if (c && c.appendStream && typeof data.chunk === 'string') c.appendStream(data.chunk);
             } catch (_) {}
         },
+        onDirectSendSuccess: function(cardId) {
+            isExecutingNow = false;
+            try {
+                const c = cardControllers[cardId];
+                if (c) {
+                    if (c._tickIv) { clearInterval(c._tickIv); c._tickIv = null; }
+                    c.setStatus('⚡ 结果已后台直达 DeepSeek 模型', '#10b981', false);
+                }
+                updateHUD('后台直达已完成', '#10b981');
+            } catch (_) {}
+        },
         onCommandResult: function(data) {
             isExecutingNow = false;
             const cardId = data.id;
