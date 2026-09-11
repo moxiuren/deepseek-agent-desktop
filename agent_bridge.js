@@ -2,38 +2,57 @@
     if (window.__agentBridgeInstalled) return;
     window.__agentBridgeInstalled = true;
 
-    // Forward console logs to native Swift
+    // Cross-platform native bridge dispatcher (supports macOS WebKit & Windows Edge WebView2)
+    function sendToNative(data) {
+        try {
+            if (window.chrome?.webview?.postMessage) {
+                window.chrome.webview.postMessage(data);
+            } else if (window.webkit?.messageHandlers?.agentBridge?.postMessage) {
+                window.webkit.messageHandlers.agentBridge.postMessage(data);
+            }
+        } catch(e) {
+            _origErr?.("[sendToNative error]", e);
+        }
+    }
+
+    // Forward console logs to native host
     const _origLog = console.log;
     const _origErr = console.error;
     console.log = function(...args) {
         _origLog.apply(console, args);
-        try {
-            window.webkit?.messageHandlers?.agentBridge?.postMessage({
-                action: "log",
-                message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
-            });
-        } catch(e){}
+        sendToNative({
+            action: "log",
+            message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
+        });
     };
     console.error = function(...args) {
         _origErr.apply(console, args);
-        try {
-            window.webkit?.messageHandlers?.agentBridge?.postMessage({
-                action: "log",
-                message: "[JS_ERROR] " + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
-            });
-        } catch(e){}
+        sendToNative({
+            action: "log",
+            message: "[JS_ERROR] " + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
+        });
     };
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4 (Hidden Background Calls & Collapsed Pills)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4 (Cross-Platform Edition)...");
 
-    const SYSTEM_PROMPT = `【系统协议：本地 macOS Agent 闭环模式已激活】
+    // Dynamic OS detection for DeepSeek Planner instructions
+    const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
+    const osPlatform = isWindows ? "Windows (PowerShell)" : "macOS (Zsh)";
+    const cmdGuide = isWindows
+        ? "- **系统命令负责文件与环境操作**：查看文件、检索目录、运行测试直接使用标准 PowerShell 命令（如 `dir` / `Get-ChildItem`、`cat` / `Get-Content`、`git`、`python`）。"
+        : "- **系统命令负责文件与环境操作**：查看文件、检索目录、运行测试直接使用标准 bash/zsh（如 `cat`、`ls`、`git`、`python3`）。";
+    const exampleCmd = isWindows
+        ? "dir ~\ncat 文件路径\npython 脚本路径"
+        : "ls -la ~/Documents/Projects\ncat 文件路径\npython3 脚本路径";
+
+    const SYSTEM_PROMPT = `【系统协议：本地 ${osPlatform} Agent 闭环模式已激活】
 你现在作为指挥大脑（Brain / Planner），拥有控制我本地电脑的执行权限。
 本地已连接极速代码执行引擎：\`agy\`（模型：Gemini 3.8 Flash Low，无思考开销，极速纯执行）。
 
 【分工原则】：
 - **你（DeepSeek）负责全部大脑思考与设计**：由你负责逻辑推演、架构规划、分步决策，不要让执行者再次思考；
 - **agy 负责极速生成代码 / 纯执行**：agy 不进行深度思考，你必须在指令中给它极其完整、无歧义的具体代码实现要求；
-- **系统命令负责文件与环境操作**：查看文件、检索目录、运行测试直接使用标准 bash（如 \`cat\`、\`ls\`、\`git\`、\`python3\`）。
+${cmdGuide}
 
 【执行协议】：
 当你需要让本地模型编写或修改代码时，请使用以下格式输出命令（agy-run 已默认配置为 3.8 Flash Low）：
@@ -42,11 +61,9 @@ agy-run "请根据以下完整要求生成代码：<你的详细完整指令>"
 \`\`\`
 （或完整参数：\`agy --model gemini-3.8-flash-low -p "指令"\`）
 
-当你需要查看文件、探索目录或执行系统脚本时，直接输出标准 bash：
+当你需要查看文件、探索目录或执行系统脚本时，直接输出命令：
 \`\`\`local_cmd
-ls -la ~/Documents/Projects
-cat 文件路径
-python3 脚本路径
+${exampleCmd}
 \`\`\`
 
 【闭环规则】：
@@ -364,18 +381,16 @@ python3 脚本路径
         isExecutingNow = true;
         controller.hidePacing();
         controller.setStatus("正在执行本地命令...", "#d97706", true);
-        controller.setOutput("[macOS 终端进程已启动，正在执行指令...]");
+        controller.setOutput("[本地终端进程已启动，正在执行指令...]");
         updateHUD("正在执行本地指令...", "#f59e0b");
 
-        console.log("[Agent Bridge] Executing in Swift:\n", command);
+        console.log("[Agent Bridge] Dispatching command to native host:\n", command);
 
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.agentBridge) {
-            window.webkit.messageHandlers.agentBridge.postMessage({
-                action: "execute",
-                command: command,
-                id: controller.cardId
-            });
-        }
+        sendToNative({
+            action: "execute",
+            command: command,
+            id: controller.cardId
+        });
     }
 
     // 5. Hide / Collapse Ugly User Feedback Messages into Sleek Compact Badges!

@@ -1,0 +1,41 @@
+<Window x:Class="DeepSeek.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="DeepSeek" Height="860" Width="1240"
+        WindowStartupLocation="CenterScreen"
+        Icon="AppIcon.ico"
+        Background="#181C27"
+        KeyDown="Window_KeyDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Menu Grid.Row="0" Background="#181C27" Foreground="#E2E8F0">
+            <MenuItem Header="文件(_F)">
+                <MenuItem Header="新建会话(_N)" InputGestureText="Ctrl+N" Click="MenuNewChat_Click"/>
+                <Separator/>
+                <MenuItem Header="退出(_X)" InputGestureText="Alt+F4" Click="MenuExit_Click"/>
+            </MenuItem>
+            <MenuItem Header="Agent 闭环(_A)">
+                <MenuItem Header="⚡️ 注入大脑协议(_I)" InputGestureText="Ctrl+I" Click="MenuInjectPrompt_Click"/>
+            </MenuItem>
+            <MenuItem Header="视图(_V)">
+                <MenuItem Header="刷新(_R)" InputGestureText="Ctrl+R" Click="MenuReload_Click"/>
+                <MenuItem Header="强制刷新" InputGestureText="Ctrl+Shift+R" Click="MenuForceReload_Click"/>
+                <Separator/>
+                <MenuItem Header="放大" InputGestureText="Ctrl++" Click="MenuZoomIn_Click"/>
+                <MenuItem Header="缩小" InputGestureText="Ctrl+-" Click="MenuZoomOut_Click"/>
+                <MenuItem Header="实际大小" InputGestureText="Ctrl+0" Click="MenuZoomReset_Click"/>
+            </MenuItem>
+            <MenuItem Header="帮助(_H)">
+                <MenuItem Header="关于 DeepSeek" Click="MenuAbout_Click"/>
+                <MenuItem Header="GitHub 仓库" Click="MenuGitHub_Click"/>
+            </MenuItem>
+        </Menu>
+
+        <wv2:WebView2 Grid.Row="1" x:Name="webView" DefaultBackgroundColor="#181C27"/>
+    </Grid>
+</Window>

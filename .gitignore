@@ -1,4 +1,16 @@
+# macOS
 .DS_Store
 *.app
 build_icon
 AppIcon.iconset/
+
+# Windows & .NET
+bin/
+obj/
+*.exe
+publish/
+windows/publish/
+.vs/
+*.user
+*.suo
+
