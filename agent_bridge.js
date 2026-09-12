@@ -77,6 +77,17 @@
     let feedbackChain = Promise.resolve();
     let prevSendAt = 0;
     let prevAcked = true;
+    // Send throttling + rate-limit backoff: the site rejects burst sends
+    // ("Messages too frequent"), which wedges the loop (request leaves but
+    // the message is refused). Floor the send rate, detect refusal, cool
+    // down, then retry once automatically.
+    const MIN_SEND_GAP_MS = 8000;
+    const BACKOFF_MS = 90000;
+    let lastAutoSendAt = 0;
+    let rateLimitBackoffUntil = 0;
+    let lastRateLimitHandledAt = 0;
+    let lastFeedbackForRetry = { text: '', at: 0 };
+    let backoffRetried = false;
     function queueFeedbackSlot(fn) {
         feedbackChain = feedbackChain.then(() => new Promise(resolve => {
             const start = Date.now();
@@ -84,9 +95,11 @@
                 let proceed = false;
                 try {
                     const lastAck = window.__lastCompletionAt || 0;
-                    if (prevAcked) proceed = true;
-                    else if (prevSendAt > 0 && lastAck >= prevSendAt) proceed = true;
-                    else if (Date.now() - start > 8000) proceed = true;
+                    const gapOk = Date.now() - lastAutoSendAt >= MIN_SEND_GAP_MS;
+                    const coolOk = Date.now() >= rateLimitBackoffUntil;
+                    if (prevAcked && gapOk && coolOk) proceed = true;
+                    else if (!prevAcked && prevSendAt > 0 && lastAck >= prevSendAt && gapOk && coolOk) proceed = true;
+                    else if (Date.now() - start > 30000) proceed = true;
                 } catch (_) { proceed = true; }
                 if (proceed) {
                     clearInterval(iv);
@@ -1296,6 +1309,7 @@ ${output}
                 // Serialize on the send slot: fill+click only after the previous
                 // send's completion request has left (or fallback timeout).
                 queueFeedbackSlot((release) => {
+                    try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
                     const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
                     updateHUD(hudMsg, "#2563eb");
 
@@ -1544,6 +1558,7 @@ ${output}
     }
 
     function triggerSend() {
+        try { lastAutoSendAt = Date.now(); } catch (_) {}
         const textarea = findInputTextarea();
         if (!textarea) return false;
 
@@ -1842,6 +1857,72 @@ ${output}
         scanAndProcessToolCalls();
         collapseToolFeedbackBubbles();
     }, 600);
+
+    // Rate-limit watcher: the site refuses burst sends ("Messages too frequent")
+    // with HTTP 200 + an error bubble, so request-left checks can't see it.
+    // On detect: pause auto-sends 90s, then retry the last feedback once.
+    function findRateLimitError() {
+        try {
+            if (!document.body) return null;
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let node;
+            const re = /too frequent|try again later|rate[\s_-]*limit|too many requests|发送频繁|操作频繁|稍后(再试|重试)|频繁操作/i;
+            while (node = walker.nextNode()) {
+                const v = node.nodeValue || '';
+                if (v.length > 200 || !re.test(v)) continue;
+                let el = node.parentElement;
+                if (!el) continue;
+                try {
+                    if (el.closest && el.closest('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill')) continue;
+                } catch (_) {}
+                const whole = ((el.innerText || el.textContent) || '');
+                if (whole.includes('[Tool Call')) continue;
+                return whole.slice(0, 120);
+            }
+        } catch (_) {}
+        return null;
+    }
+    function enterBackoff(source, detail) {
+        try {
+            rateLimitBackoffUntil = Date.now() + BACKOFF_MS;
+            backoffRetried = false;
+            try { diagAttach({ phase: 'rate-limit', source: source, detail: (detail || '').slice(0, 120) }); } catch (_) {}
+            updateHUD('发送过于频繁，冷却90秒后自动重试…', '#f59e0b');
+            console.error('[Agent Bridge] rate limited (' + source + '), backing off 90s');
+        } catch (_) {}
+    }
+    setInterval(() => {
+        try {
+            if (rateLimitBackoffUntil > 0) {
+                if (Date.now() < rateLimitBackoffUntil) return; // still cooling
+                // Expired: retry once, then clear and resume.
+                rateLimitBackoffUntil = 0;
+                if (!backoffRetried && lastFeedbackForRetry.text &&
+                    Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000) {
+                    backoffRetried = true;
+                    updateHUD('冷却结束，重发上一条反馈…', '#2563eb');
+                    try { diagAttach({ phase: 'rate-limit-retry' }); } catch (_) {}
+                    injectPrompt(lastFeedbackForRetry.text, true);
+                    burstCollapse();
+                }
+                return;
+            }
+            let hit = null;
+            try {
+                if ((window.__lastSendRejectedAt || 0) > lastRateLimitHandledAt) {
+                    lastRateLimitHandledAt = window.__lastSendRejectedAt;
+                    hit = 'stream-flag';
+                }
+            } catch (_) {}
+            // DOM error text only counts shortly after one of OUR sends
+            // (never trust stray discussion text).
+            if (!hit && Date.now() - lastAutoSendAt < 25000) {
+                const found = findRateLimitError();
+                if (found) hit = 'dom:' + found;
+            }
+            if (hit) enterBackoff(hit, hit);
+        } catch (_) {}
+    }, 3000);
 
     setupDragAndDropPathHandler();
     setTimeout(createFloatingHUD, 800);

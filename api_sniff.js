@@ -90,6 +90,16 @@
     function isCompletionUrl(u) {
         try { return /\/api\/v0\/chat\/completion/.test(String(u || '')); } catch (_) { return false; }
     }
+    // First-chunk error signature: rejected sends stay HTTP 200, the refusal
+    // only shows in the stream / bubble text.
+    var LIMIT_RE = /too frequent|try again later|rate[\s_-]*limit|too many requests|发送频繁|操作频繁|稍后(再试|重试)|频繁操作/i;
+    function flagRateLimit(url) {
+        try {
+            window.__lastSendRejectedAt = Date.now();
+            hideGlobalSniff('__lastSendRejectedAt');
+            emit({ side: 'limit-hit', url: String(url || '').slice(0, 300) });
+        } catch (_) {}
+    }
     function isPowUrl(u) {
         try { return /\/api\/v0\/chat\/create_pow_challenge/.test(String(u || '')); } catch (_) { return false; }
     }
@@ -162,6 +172,21 @@
             } catch (_) {}
             return Reflect.apply(t, th, args).then(function(res) {
                 uploadRes(res.url);
+                if (isCompletionUrl(res.url)) {
+                    try {
+                        const c = res.clone();
+                        if (c.body && c.body.getReader) {
+                            const rdr = c.body.getReader();
+                            rdr.read().then(function(r) {
+                                try { rdr.cancel(); } catch (_) {}
+                                try {
+                                    const head = new TextDecoder().decode((r && r.value) || new Uint8Array()).slice(0, 800);
+                                    if (LIMIT_RE.test(head)) flagRateLimit(res.url);
+                                } catch (_) {}
+                            }).catch(function() {});
+                        }
+                    } catch (_) {}
+                }
                 if (isPowUrl(res.url)) {
                     // Small JSON challenge — safe to buffer for backchannel design.
                     try {
@@ -227,6 +252,17 @@
                     th.addEventListener('load', function() { finish(true); });
                     th.addEventListener('error', function() { finish(true); });
                     th.addEventListener('abort', function() { finish(true); });
+                    if (isCompletionUrl(th.__sniffUrl || '')) {
+                        th.addEventListener('progress', function() {
+                            try {
+                                if (th.__peekDone) return;
+                                const t = String(th.responseText || '').slice(0, 800);
+                                if (!t) return;
+                                th.__peekDone = true;
+                                if (LIMIT_RE.test(t)) flagRateLimit(th.__sniffUrl || '');
+                            } catch (_) {}
+                        });
+                    }
                 } else {
                     th.addEventListener('load', function() { finish(false); });
                     th.addEventListener('error', function() { finish(false); });
