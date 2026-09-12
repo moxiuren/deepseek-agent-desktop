@@ -153,7 +153,7 @@
                     var body = (init && Object.prototype.hasOwnProperty.call(init, 'body')) ? init.body : undefined;
                     var rec = { side: 'fetch-req', method: method, url: String(url).slice(0, 500),
                            headers: redactHeaders((init && init.headers) || (input && input.headers)),
-                           body: summarizeBody(body) };
+                           body: summarizeBody(body, isInterestingUrl(url) ? 12000 : 3000) };
                     if (isInterestingUrl(url)) {
                         rec.headerNames = headerNamesOf((init && init.headers) || (input && input.headers));
                     }

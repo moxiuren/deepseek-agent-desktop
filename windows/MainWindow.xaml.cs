@@ -1303,6 +1303,7 @@ namespace DeepSeek
             "url:location.href," +
             "rs:document.readyState," +
             "hudBtn:!!document.getElementById('agent-inject-btn')," +
+            "scan:((window.__agentBridge && window.__agentBridge._debug && window.__agentBridge._debug.describeScan) ? window.__agentBridge._debug.describeScan() : null)," +
             "textareas:[...document.querySelectorAll('textarea')].map(t=>({id:t.id,cls:String(t.className).slice(0,50),ph:t.placeholder,dis:t.disabled}))," +
             "ces:[...document.querySelectorAll('[contenteditable]')].map(x=>({tag:x.tagName,cls:String(x.className).slice(0,50)}))" +
             "})";

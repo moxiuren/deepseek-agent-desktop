@@ -64,6 +64,7 @@
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
+【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
 请确认收到，并等待用户指令。`;
 
     let autoExecute = true;
@@ -104,6 +105,12 @@
     let cardControllers = {};
     let blockWatchMap = new Map();
     let pendingFeedbackTimer = null;
+    // Direct-loop virtual queue: replies arriving out-of-band are scanned here
+    // and dispatched one at a time (the page stays a passive viewport).
+    let virtualQueue = [];
+    let directDepth = 0;
+    let lastDirectReplySig = '';
+    let lastDirectReplyAt = 0;
     // Processed/collapsed tracking lives in WeakSets, NOT data-* attributes,
     // so our bookkeeping leaves no DOM fingerprints.
     const processedBlocks = new WeakSet();
@@ -114,13 +121,16 @@
     }
 
     function isQuoteBalanced(cmd) {
+        // NOTE: PowerShell's escape char is the BACKTICK, not backslash.
+        // Treating \ as escape breaks every Windows path ending in \'
+        // (the string then looks forever-unbalanced and the call never fires).
         let inDouble = false;
         let inSingle = false;
         let escaped = false;
         for (let i = 0; i < cmd.length; i++) {
             let ch = cmd[i];
             if (escaped) { escaped = false; continue; }
-            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '`') { escaped = true; continue; }
             if (ch === '"' && !inSingle) inDouble = !inDouble;
             else if (ch === "'" && !inDouble) inSingle = !inSingle;
         }
@@ -600,12 +610,28 @@
         const now = Date.now();
 
         // Scope whitelist: only blocks inside the LATEST message-like container
-        // may start a call. History blocks must never re-fire (ghost writes).
+        // may start a call. Walk from the end and take the first container that
+        // holds code but is neither our feedback (marker) nor our own UI nor the
+        // composer (no code). Bare "last container" misfires when the composer
+        // or our own bubbles sort after the model message.
         // Falls back to unscoped when the site DOM matches nothing.
         let scanScope = null;
         try {
             const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]');
-            if (containers.length) scanScope = containers[containers.length - 1];
+            for (let i = containers.length - 1; i >= 0; i--) {
+                const c = containers[i];
+                let t = '';
+                try { t = c.textContent || ''; } catch (_) {}
+                if (t.includes('[Tool Call')) continue;
+                let hasCode = false, ownUi = false;
+                try {
+                    hasCode = !!c.querySelector('pre, code');
+                    ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
+                } catch (_) {}
+                if (ownUi || !hasCode) continue;
+                scanScope = c;
+                break;
+            }
         } catch (_) {}
 
         for (let el of blocks) {
@@ -1069,6 +1095,49 @@
         _debug: {
             findInputTextarea: findInputTextarea,
             findSendButton: findSendButton,
+            describeScan: function() {
+                // Ground truth for "why isn't this block dispatching".
+                try {
+                    const blocks = Array.from(document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block'));
+                    const containers = Array.from(document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]'));
+                    let scopeIdx = -1;
+                    for (let i = containers.length - 1; i >= 0; i--) {
+                        const c = containers[i];
+                        let t = '';
+                        try { t = c.textContent || ''; } catch (_) {}
+                        if (t.includes('[Tool Call')) continue;
+                        let hasCode = false, ownUi = false;
+                        try {
+                            hasCode = !!c.querySelector('pre, code');
+                            ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
+                        } catch (_) {}
+                        if (ownUi || !hasCode) continue;
+                        scopeIdx = i;
+                        break;
+                    }
+                    const tail = blocks.slice(-4).map((el, k) => {
+                        let parent = null;
+                        try { parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el; } catch (_) { parent = el; }
+                        const ft = ((parent.innerText || parent.textContent) || '');
+                        return {
+                            n: blocks.length - 4 + k,
+                            tag: el.tagName,
+                            cls: String(el.className).slice(0, 60),
+                            processed: processedBlocks.has(el),
+                            parentProcessed: parent ? processedBlocks.has(parent) : null,
+                            inScope: scopeIdx >= 0 ? containers[scopeIdx].contains(parent) : 'no-scope',
+                            hasMarker: ft.includes('[Tool Call'),
+                            hasLocalCmd: ft.includes('local_cmd'),
+                            head: ft.slice(0, 60)
+                        };
+                    });
+                    return {
+                        blocks: blocks.length, containers: containers.length, scopeIdx: scopeIdx,
+                        scopeCls: scopeIdx >= 0 ? String(containers[scopeIdx].className).slice(0, 80) : '',
+                        execNow: isExecutingNow, autoExec: autoExecute, tail: tail
+                    };
+                } catch (e) { return { error: String((e && e.message) || e).slice(0, 120) }; }
+            },
             describeSendButton: function() {
                 const b = findSendButton();
                 if (!b) return { found: false };
@@ -1112,6 +1181,29 @@
                 }
                 updateHUD('后台直达已完成', '#10b981');
             } catch (_) {}
+            try { pumpVirtual(); } catch (_) {}
+        },
+        onDirectReply: function(data) {
+            // Assistant reply arrived out-of-band: scan for fresh calls, loop on.
+            try {
+                const text = (data && data.text) || '';
+                const sig = text.length + ':' + text.slice(0, 80);
+                const nowMs = Date.now();
+                if (sig === lastDirectReplySig && nowMs - lastDirectReplyAt < 60000) return;
+                lastDirectReplySig = sig; lastDirectReplyAt = nowMs;
+                if (!text.trim()) { updateHUD('直发回执为空', '#f59e0b'); return; }
+                const calls = scanVirtualReply(text);
+                if (!calls.length) { updateHUD('直发回执无新调用，环路结束', '#10b981'); return; }
+                directDepth++;
+                if (directDepth > 30) {
+                    updateHUD('直发轮数超限，停止（请接管）', '#ef4444');
+                    console.error('[Agent Bridge] direct loop depth exceeded, stopping');
+                    return;
+                }
+                for (const c of calls) virtualQueue.push(c);
+                updateHUD(`直发回执解析出 ${calls.length} 个调用（第 ${directDepth} 轮）`, '#2563eb');
+                pumpVirtual();
+            } catch (e) { console.error('[Agent Bridge] onDirectReply error:', e); }
         },
         onCommandResult: function(data) {
             isExecutingNow = false;
@@ -1121,6 +1213,7 @@
                 const _c = cardControllers[cardId];
                 if (_c && _c._tickIv) { clearInterval(_c._tickIv); _c._tickIv = null; }
             } catch (_) {}
+            try { pumpVirtual(); } catch (_) {}
             const output = data.output || "(执行完毕，无输出)";
             const isAttachment = !!data.isAttachment;
 
@@ -1269,6 +1362,121 @@ ${output}
         }
     };
     hideGlobal('__agentBridge');
+
+    // ---- Direct-loop support: fixed activity panel + markdown virtual scan ----
+    let agentPanelBodyEl = null;
+    function ensureAgentPanel() {
+        try {
+            let panel = document.getElementById('agent-direct-panel');
+            if (panel) { agentPanelBodyEl = document.getElementById('agent-direct-panel-body'); return panel; }
+            if (!document.body) return null;
+            panel = document.createElement('div');
+            panel.id = 'agent-direct-panel';
+            panel.style.cssText = 'position:fixed;right:14px;bottom:14px;width:360px;max-height:46vh;display:flex;flex-direction:column;background:#ffffff;border:1.5px solid #3b82f6;border-radius:12px;box-shadow:0 8px 30px rgba(37,99,235,.25);z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;overflow:hidden;';
+            panel.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border-bottom:1px solid #bfdbfe;cursor:pointer;" id="agent-direct-panel-head"><span style="font-size:12px;font-weight:700;color:#1e40af;">Agent 直发面板 <span id="agent-direct-panel-count" style="color:#64748b;font-weight:500;"></span></span><span id="agent-direct-panel-toggle" style="font-size:11px;color:#64748b;">[收起]</span></div><div id="agent-direct-panel-body" style="overflow-y:auto;padding:8px 10px;"></div>';
+            document.body.appendChild(panel);
+            const head = document.getElementById('agent-direct-panel-head');
+            if (head) head.addEventListener('click', () => {
+                const b = document.getElementById('agent-direct-panel-body');
+                const t = document.getElementById('agent-direct-panel-toggle');
+                if (!b) return;
+                const hidden = b.style.display === 'none';
+                b.style.display = hidden ? '' : 'none';
+                if (t) t.textContent = hidden ? '[收起]' : '[展开]';
+            });
+            agentPanelBodyEl = document.getElementById('agent-direct-panel-body');
+            return panel;
+        } catch (_) { return null; }
+    }
+    function bumpPanelCount() {
+        try {
+            const c = document.getElementById('agent-direct-panel-count');
+            if (c) c.textContent = `(${document.querySelectorAll('#agent-direct-panel-body .agent-tool-card').length})`;
+        } catch (_) {}
+    }
+    function stripVirtualDirective(body) {
+        const lines = body.split(/\r?\n/);
+        const idx = lines.findIndex(l => l.trim().length > 0);
+        if (idx !== -1 && /^(?:write_file|write-file|file)\s*:|^(?:#|\/\/|\/\*|--|;|<!--)\s*(?:file|filepath|path):/i.test(lines[idx].trim())) {
+            lines.splice(idx, 1);
+        }
+        return lines.join('\n');
+    }
+    // Scan assistant markdown (not rendered DOM) for fresh tool calls.
+    // Stricter than the DOM scanner: exact fence tags only, deduped.
+    function scanVirtualReply(text) {
+        const out = [];
+        const seen = new Set();
+        const fenceRe = /```([^\n]*)\n([\s\S]*?)```/g;
+        let m;
+        while ((m = fenceRe.exec(text))) {
+            const info = (m[1] || '').trim();
+            const body = (m[2] || '').replace(/\s+$/, '');
+            if (!body) continue;
+            const wInfo = info.match(/^(?:write_file|write-file):\s*(\S+)/i);
+            if (wInfo && wInfo[1]) {
+                const p = cleanPathCandidate(wInfo[1]);
+                if (p) {
+                    const key = 'w:' + p;
+                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: stripVirtualDirective(body) }); }
+                }
+                continue;
+            }
+            const infoCmd = /^(local_cmd|bash|sh)$/i.test(info);
+            const bodyCmd = /agy-run|agy --model|opencode run/.test(body);
+            if (infoCmd || bodyCmd) {
+                const lines = body.split(/\r?\n/).map(l => l.trim()).filter(l => {
+                    if (!l) return false;
+                    if (l === 'Copy' || l === 'Download' || l === '复制' || l === '下载') return false;
+                    if (l.includes('local_cmdCopyDownload')) return false;
+                    if (l === 'local_cmd' || l === 'bash' || l === 'sh') return false;
+                    return true;
+                });
+                const cmd = lines.join('\n').trim();
+                if (cmd && cmd.length >= 2 && isQuoteBalanced(cmd)) {
+                    const key = 'c:' + cmd;
+                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'cmd', command: cmd }); }
+                }
+                continue;
+            }
+            const fl = body.split(/\r?\n/).map(l => l.trim()).find(l => l);
+            const cm = fl && fl.match(/^(?:#|\/\/|\/\*|--|;|<!--)\s*(?:file|filepath|path):\s*(\S+)/i);
+            if (cm && cm[1]) {
+                const p = cleanPathCandidate(cm[1]);
+                if (p) {
+                    const key = 'w:' + p;
+                    if (!seen.has(key)) { seen.add(key); out.push({ type: 'write_file', path: p, content: stripVirtualDirective(body) }); }
+                }
+            }
+        }
+        return out;
+    }
+    function pumpVirtual() {
+        try {
+            if (isExecutingNow || !autoExecute) return;
+            const job = virtualQueue.shift();
+            if (!job) return;
+            ensureAgentPanel();
+            const body = agentPanelBodyEl;
+            if (!body) { virtualQueue.unshift(job); return; }
+            const anchor = document.createElement('div');
+            anchor.style.display = 'none';
+            body.appendChild(anchor);
+            if (job.type === 'write_file') {
+                const controller = renderToolCallCard(anchor, job.content, (content, ctrl) => {
+                    executeFileWrite(job.path, content, ctrl);
+                }, 'write_file', { path: job.path, content: job.content });
+                bumpPanelCount();
+                if (autoExecute && !isExecutingNow) executeFileWrite(job.path, job.content, controller);
+            } else {
+                const controller = renderToolCallCard(anchor, job.command, (cmd, ctrl) => {
+                    executeCommand(cmd, ctrl);
+                }, 'cmd');
+                bumpPanelCount();
+                if (autoExecute && !isExecutingNow) executeCommand(job.command, controller);
+            }
+        } catch (e) { console.error('[Agent Bridge] pumpVirtual error:', e); }
+    }
 
     // 7. Textarea Injection & Send
     function findInputTextarea() {
