@@ -485,7 +485,9 @@ namespace DeepSeek
                         else if (b.TryGetProperty("fields", out var f)) bodyPrev = string.Join(",", f.EnumerateArray().Select(x => x.GetString()));
                         else if (b.TryGetProperty("len", out var l)) bodyPrev = $"len={l}";
                     }
-                    if (bodyPrev.Length > 1500) bodyPrev = bodyPrev.Substring(0, 1500) + "...[truncated]";
+                    if (bodyPrev.Length > 1500 && (url.Contains("/api/v0/chat/completion") || url.Contains("/api/v0/file/upload_file")))
+                        bodyPrev = bodyPrev.Substring(0, 12000) + "...[truncated]";
+                    else if (bodyPrev.Length > 1500) bodyPrev = bodyPrev.Substring(0, 1500) + "...[truncated]";
                     string hnames = "";
                     if (root.TryGetProperty("headerNames", out var h) && h.ValueKind == JsonValueKind.Array)
                         hnames = string.Join(",", h.EnumerateArray().Select(x => x.GetString()));
@@ -493,7 +495,9 @@ namespace DeepSeek
                     if (resBody.Length > 2000) resBody = resBody.Substring(0, 2000) + "...[truncated]";
                     App.Log($"[APISNIFF] {side} {method} {url} status={status} ct={ct} bodyKind={bodyKind} {bodyPrev} hnames=[{hnames}] resBody={resBody}");
 
-                    // Track session and message IDs for direct API send
+                    // Track session/parent ids ONLY from real completion requests.
+                    // Telemetry bodies carry unrelated message ids (e.g. 1) that are
+                    // not valid parents and fork/break the thread server-side.
                     try
                     {
                         if (url.Contains("/api/v0/chat/completion") && root.TryGetProperty("body", out var bElem) && bElem.ValueKind == JsonValueKind.Object && bElem.TryGetProperty("preview", out var rawPrev))
@@ -507,14 +511,6 @@ namespace DeepSeek
                                 if (jd.RootElement.TryGetProperty("parent_message_id", out var pid) && pid.ValueKind == JsonValueKind.Number)
                                     _apiClient.UpdateSessionState(null, pid.GetInt32());
                             }
-                        }
-                        if (bodyPrev.Contains("ds_chat_session_id") && bodyPrev.Contains("ds_chat_message_id"))
-                        {
-                            var matchSid = System.Text.RegularExpressions.Regex.Match(bodyPrev, @"\\""ds_chat_session_id\\"":\\""([^\\""]+)\\""");
-                            var matchMid = System.Text.RegularExpressions.Regex.Match(bodyPrev, @"\\""ds_chat_message_id\\"":(\d+)");
-                            string? sid = matchSid.Success ? matchSid.Groups[1].Value : null;
-                            int? mid = matchMid.Success && int.TryParse(matchMid.Groups[1].Value, out int mVal) ? mVal : null;
-                            _apiClient.UpdateSessionState(sid, mid);
                         }
                     }
                     catch {}
@@ -833,8 +829,67 @@ namespace DeepSeek
             return msg;
         }
 
+        // Scan discipline guard: unbounded recursive scans of huge roots take
+        // minutes and always die at the 180s timeout. Reject with guidance so
+        // the planner learns in one round. Escape hatch: #scan-ok comment.
+        private static string? CheckScanDiscipline(string command, string userProfile)
+        {
+            string n = System.Text.RegularExpressions.Regex.Replace(
+                command.ToLowerInvariant(), @"\s+", " ").Trim();
+            if (n.Contains("#scan-ok")) return null;
+            bool hasCmdlet = System.Text.RegularExpressions.Regex.IsMatch(n, @"\bget-childitem\b")
+                || System.Text.RegularExpressions.Regex.IsMatch(n, @"(?:^|[;|&({\[])\s*(gci|dir|ls)\b");
+            if (!hasCmdlet || !System.Text.RegularExpressions.Regex.IsMatch(n, @"-rec\w*")) return null;
+            if (System.Text.RegularExpressions.Regex.IsMatch(n, @"-depth\s+\d+")) return null;
+
+            string up = userProfile.ToLowerInvariant().TrimEnd('\\');
+            string upRx = System.Text.RegularExpressions.Regex.Escape(up);
+            bool hitsRoot =
+                System.Text.RegularExpressions.Regex.IsMatch(n, upRx + @"(?=[""'\s]|$)") ||
+                System.Text.RegularExpressions.Regex.IsMatch(n, @"[a-z]:\\(?=[""'\s]|$)") ||
+                n.Contains("c:\\windows") || n.Contains("c:\\program files") ||
+                n.Contains("$env:systemroot") || n.Contains("$env:windir") || n.Contains("$env:programfiles") ||
+                n.Contains("~\"") || n.Contains("~'") || n.Contains("~ ") || n.EndsWith("~") ||
+                n.Contains("$home\"") || n.Contains("$home'") || n.Contains("$home ") || n.EndsWith("$home") ||
+                n.Contains("$env:userprofile\"") || n.Contains("$env:userprofile'") ||
+                n.Contains("%userprofile%") ||
+                n.Contains("hkcu:") || n.Contains("hklm:") || n.Contains("hkcr:") ||
+                n.Contains("hku:") || n.Contains("hkcc:") || n.Contains("cert:") || n.Contains("wsman:");
+            if (!hitsRoot) return null;
+
+            string head = command.Length > 200 ? command.Substring(0, 200) + "..." : command;
+            return "[本地安全护栏拦截，未执行] 无深度限制的大目录递归扫描通常跑几分钟且会被 180 秒超时砍掉。\n"
+                + "规则：对用户目录根、盘符根、Windows/Program Files、注册表/证书区递归必须带 -Depth（建议≤3）；优先查 Desktop、Documents、Projects，禁扫 AppData。\n"
+                + "改法示例：Get-ChildItem \"" + userProfile + "\\Documents\" -Recurse -Depth 3 -Filter \"*关键词*\" -ErrorAction SilentlyContinue\n"
+                + "确需全量扫描时，在命令任意位置加注释 #scan-ok 豁免。\n"
+                + "原命令：" + head;
+        }
+
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
+            // Scan discipline first: instant reject, never consumes queue slots.
+            string userProfileDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string? disciplineMsg = CheckScanDiscipline(command, userProfileDir);
+            if (disciplineMsg != null)
+            {
+                App.Log($"[ScanGuard] rejected: {command.Substring(0, Math.Min(120, command.Length))}");
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    try
+                    {
+                        var payload = new { id = id, exitCode = 1, output = disciplineMsg };
+                        string jsonString = JsonSerializer.Serialize(payload);
+                        string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";
+                        await webView.CoreWebView2.ExecuteScriptAsync(js);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
+                    }
+                });
+                return;
+            }
+
             bool gateTaken = false;
             try { gateTaken = await _execGate.WaitAsync(TimeSpan.FromSeconds(120)); } catch { gateTaken = false; }
             if (!gateTaken)
@@ -1089,9 +1144,12 @@ namespace DeepSeek
             {
                 try
                 {
-                    bool directSent = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt);
-                    if (directSent)
+                    DirectResult? direct = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt);
+                    if (direct != null && direct.Ok)
                     {
+                        // Chain the next turn on OUR OWN reply id (page sniffing goes stale in direct mode).
+                        if (direct.ReplyMessageId.HasValue)
+                            _apiClient.UpdateSessionState(direct.SessionId, direct.ReplyMessageId.Value);
                         App.Log($"[DirectSend] Command {id} sent out-of-band directly to model.");
                         await Dispatcher.InvokeAsync(async () =>
                         {
@@ -1101,6 +1159,18 @@ namespace DeepSeek
                                 await webView.CoreWebView2.ExecuteScriptAsync(notifyJs);
                             }
                             catch { }
+                            try
+                            {
+                                string reply = direct.ReplyText ?? "";
+                                if (reply.Length > 60000) reply = reply.Substring(0, 60000) + "\n...[回执过长已截断]";
+                                string payload = JsonSerializer.Serialize(new { text = reply });
+                                await webView.CoreWebView2.ExecuteScriptAsync(
+                                    $"window.__agentBridge && window.__agentBridge.onDirectReply && window.__agentBridge.onDirectReply({payload});");
+                            }
+                            catch (Exception ex2)
+                            {
+                                App.Log($"[DirectSend] onDirectReply failed: {ex2.Message}");
+                            }
                         });
                         return;
                     }
@@ -1137,7 +1207,7 @@ namespace DeepSeek
             });
         }
 
-        private async Task<bool> TryDirectSendAsync(
+        private async Task<DirectResult?> TryDirectSendAsync(
             string id,
             int exitCode,
             string output,
@@ -1147,13 +1217,13 @@ namespace DeepSeek
             string? base64Data,
             string? prompt)
         {
-            if (webView?.CoreWebView2 == null) return false;
+            if (webView?.CoreWebView2 == null) return null;
 
             string? token = await _apiClient.ExtractTokenAsync(webView.CoreWebView2);
             if (string.IsNullOrEmpty(token))
             {
                 App.Log("[DirectSend] User token not available in localStorage");
-                return false;
+                return null;
             }
 
             string sessionId = _apiClient.CurrentSessionId ?? "";
@@ -1166,15 +1236,11 @@ namespace DeepSeek
             if (string.IsNullOrEmpty(sessionId))
             {
                 App.Log("[DirectSend] Current chat session ID not found");
-                return false;
+                return null;
             }
 
-            int parentMsgId = _apiClient.LastMessageId ?? -1;
-            if (parentMsgId <= 0)
-            {
-                App.Log("[DirectSend] Last parent message ID not found");
-                return false;
-            }
+            // First message in a session has no parent (page sends null); mirror that.
+            int? parentMsgId = _apiClient.LastMessageId;
 
             List<string>? refFileIds = null;
             if (isAttachment && !string.IsNullOrEmpty(base64Data))
