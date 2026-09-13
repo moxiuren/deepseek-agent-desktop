@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.4 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.5 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -61,6 +61,8 @@
 \`\`\`write_file:目标路径
 文件内容
 \`\`\`
+LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
+NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long tasks use detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log, then poll with Get-Content -Tail.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律四条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连；④Exit:1 且报错含 not recognized / Unexpected token / Missing expression → 说明命令被提取错了，换写法重发，严禁原样重发。
@@ -886,7 +888,20 @@
 
             // If SSE stream completion was recorded within the last 15s, content is stable -> allow 800ms debounce
             const streamDone = (window.__lastCompletionAt && (now - window.__lastCompletionAt >= 500) && (now - window.__lastCompletionAt < 15000));
-            const debounceThreshold = streamDone ? 800 : 1800;
+            const debounceThreshold0 = streamDone ? 800 : 1800;
+            let debounceThreshold = debounceThreshold0;
+            let dispatchGateCause = 'fast';
+            // v4.3.5 write completion gate (P0-b): long files stream for minutes; a bare
+            // 1800ms DOM-quiet gap mid-stream is NOT completeness (P4: 320 lines -> 82,
+            // last line half-cut). Writes dispatch only when the stream ended AFTER the
+            // last content change, or after 10s of DOM quiet. Cmds keep the fast path
+            // (bracket/quote gates cover partials there).
+            if (isFileWrite) {
+                const lastChg = (tracker && tracker.lastChange) || 0;
+                const completedAfterChange = (window.__lastCompletionAt || 0) > lastChg;
+                if (completedAfterChange) { debounceThreshold = 800; dispatchGateCause = 'stream-settled'; }
+                else { debounceThreshold = 10000; dispatchGateCause = 'quiet-10s'; }
+            }
 
             if (now - tracker.lastChange < debounceThreshold) {
                 continue;
@@ -930,6 +945,7 @@
 
             if (isFileWrite) {
                 console.log(`[Agent Bridge] Complete File Write Detected. Target: ${fileInfo.path} (${fileContent.length} chars)`);
+                try { diagAttach({ phase: 'dispatch-write', v: '4.3.5', gate: dispatchGateCause, path: String(fileInfo.path).slice(0, 80), chars: fileContent.length }); } catch (_) {}
 
                 const controller = renderToolCallCard(parent, fileContent, (content, ctrl) => {
                     executeFileWrite(fileInfo.path, content, ctrl);
@@ -1001,6 +1017,7 @@
                             addProcessedSig(sig);
                             blockWatchMap.delete(scanScope);
                             console.log(`[Agent Bridge] [Scope Fallback] Complete File Write Detected: ${targetPath} (${fileContent.length} chars)`);
+                            try { diagAttach({ phase: 'dispatch-write', v: '4.3.5', gate: 'close-fence', path: String(targetPath).slice(0, 80), chars: fileContent.length }); } catch (_) {}
                             const controller = renderToolCallCard(scanScope, fileContent, (content, ctrl) => {
                                 executeFileWrite(targetPath, content, ctrl);
                             }, 'write_file', { path: targetPath, content: fileContent });
@@ -1072,7 +1089,7 @@
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.4', cmd: normCmd.slice(0, 80) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.5', cmd: normCmd.slice(0, 80) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1110,6 +1127,19 @@
         }
         try { pendingDispatch.set(controller.cardId, { sig: 'cmd:' + normCmd, at: Date.now() }); } catch (_) {}
         try { lastDispatchAt = Date.now(); } catch (_) {}
+
+        // v4.3.5 Start-Job intercept (P2-b/P1-b): the hosted runspace cannot spawn
+        // pwsh.exe job hosts. Refuse with the working detached pattern instead of
+        // letting it fail with 3 cascading errors. Detached jobs also bypass the
+        // serial queue, partially mitigating long-task blocking.
+        if (/\bStart-Job\b/i.test(command)) {
+            const sjMsg = '[已拦截] Start-Job 在进程内 runspace 宿主下不可用（无 pwsh.exe 后台进程）。改用分离式异步：\n$log = "C:/Windows/TEMP/opencode/job-NAME.log"\nStart-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-Command","<你的命令> *>&1 | Out-File -Encoding utf8 $log"\necho "DETACHED:$log"\n然后轮询：Get-Content $log -Tail 20（日志出现即代表已在后台跑，不占执行通道）。';
+            try { controller.setStatus('已拦截：Start-Job 不可用', '#ef4444', false); } catch (_) {}
+            try { controller.setOutput(sjMsg, true); } catch (_) {}
+            try { updateHUD('Start-Job 已拦截，已给异步模板', '#ef4444'); } catch (_) {}
+            isExecutingNow = false;
+            return;
+        }
 
         sendToNative({
             action: "execute",
