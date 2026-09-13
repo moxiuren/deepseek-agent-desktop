@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.3 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.4 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -91,6 +91,10 @@
     let lastRateLimitHandledAt = 0;
     let lastFeedbackForRetry = { text: '', at: 0 };
     let backoffRetried = false;
+    // v4.3.4 receipt integrity (P1.3): dispatch→result correlation + stream accumulation.
+    const pendingDispatch = new Map();
+    let lastDispatchAt = 0;
+    const streamBuf = {};
     function queueFeedbackSlot(fn) {
         feedbackChain = feedbackChain.then(() => new Promise(resolve => {
             const start = Date.now();
@@ -315,6 +319,40 @@
             .replace(/'/g, "&#039;");
     }
 
+    // v4.3.4 DSML 污染净化（P0.1）。DeepSeek 客户端偶发把内部工具标记（DSML）
+    // 当正文混入 local_cmd / write_file：形如 </parameter>、<invoke>、</calls>，
+    // DSML 变体如 <|DSML| parameter>，竖线可能是 ASCII | / 全角 ｜(U+FF5C) / │(U+2502)。
+    // 只剥离“尾部连续污染行/尾巴”，正文中间的不动，避免误伤正常内容。
+    const DSML_TAG_LINE = /^\s*<\/?[^>\n]*DSML[^>\n]*>\s*$/i;
+    const DSML_BARE_TAIL = /^\s*<\/?(parameter|invoke|calls|result)(\s[^>\n]*)?\/?>\s*$/i;
+    function stripDsmlPollution(text) {
+        try {
+            let s = String(text == null ? '' : text);
+            if (!/DSML/i.test(s) && !/<\/?(parameter|invoke|calls|result)[\s>\/]/i.test(s)) return s;
+            const lines = s.split('\n');
+            while (lines.length && (DSML_TAG_LINE.test(lines[lines.length - 1]) || DSML_BARE_TAIL.test(lines[lines.length - 1]))) lines.pop();
+            s = lines.join('\n');
+            s = s.replace(/(\s*<\/?[^>\n]*DSML[^>\n]*>\s*)+$/i, '');
+            s = s.replace(/(\s*<\/?(parameter|invoke|calls|result)(\s[^>\n]*)?\/?>\s*)+$/i, '');
+            return s;
+        } catch (_) { return text; }
+    }
+    function utf8len(s) { try { return new TextEncoder().encode(String(s || '')).length; } catch (_) { return String(s || '').length; } }
+    // v4.3.4 危险通配符拒收（P3.7）。Windows 下 Remove-Item -Filter 'X.*' 会连本体一起匹配。
+    function refuseDangerousWildcard(cmd) {
+        try {
+            const c = String(cmd || '');
+            if (/\bRemove-Item\b[^\n]*-Filter\s+['"][^'"]*\.\*['"]/i.test(c)) {
+                return '[已拒绝] Remove-Item -Filter 含 ".*" 尾缀：在 Windows 下会额外匹配无后缀本体（如 X.md.* 命中 X.md），极易误删。请改用 Vault 唯一入口 02-System-Rules/tools/vs.py 预览确认后再删。';
+            }
+            if (/\bRemove-Item\b/i.test(c) && !/-WhatIf\b/i.test(c) &&
+               /(?:^|\n)\s*Remove-Item\b[^\n]*?['"]?[^'"\n\s]*\*['"]?\s*$/im.test(c)) {
+                return '[已拒绝] Remove-Item 目标以裸 * 结尾且无 -WhatIf。请先加 -WhatIf 预演，或走 vs.py 唯一入口。';
+            }
+        } catch (_) {}
+        return null;
+    }
+
     function extractPureCommand(blockNode) {
         let codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
         let rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : (blockNode.innerText || blockNode.textContent);
@@ -332,7 +370,7 @@
             return true;
         });
 
-        return lines.join('\n').trim();
+        return stripDsmlPollution(lines.join('\n').trim());
     }
 
     // Direct File Output Protocol Helpers
@@ -489,7 +527,7 @@
         content = cl.join('\n');
         // Clean single leading newline if created by splicing first line
         content = content.replace(/^\r?\n/, '');
-        return content;
+        return stripDsmlPollution(content);
     }
 
     // 2. Render Tool Call Card UI (Clean Terminal output inside DeepSeek's side)
@@ -873,6 +911,16 @@
                 continue;
             }
 
+            // v4.3.4 streaming partial guard (P0.2): an OPEN fence with no CLOSING fence
+            // means the model is still writing; dispatching now = silent truncation.
+            // Rendered code shapes carry no backticks at all and pass through untouched.
+            if (isFileWrite && /```\s*(?:write_file|write-file|file)\s*:/i.test(fullText) && !/\n\s*```\s*$/.test(fullText)) {
+                continue;
+            }
+            if (!isFileWrite && /```\s*(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText) && !/\n\s*```\s*$/.test(fullText)) {
+                continue;
+            }
+
             processedBlocks.add(el);
             processedBlocks.add(parent);
             if (scanScope) processedBlocks.add(scanScope);
@@ -933,7 +981,7 @@
                 if (writeMatch) {
                     const rawPath = writeMatch[1];
                     const targetPath = cleanPathCandidate(rawPath);
-                    const fileContent = writeMatch[2] || '';
+                    const fileContent = stripDsmlPollution(writeMatch[2] || '');
                     if (targetPath && fileContent.trim()) {
                         const trackKey = targetPath + "::" + fileContent;
                         const sig = 'write:' + targetPath + ':' + fileContent.length;
@@ -964,13 +1012,14 @@
                     }
                 } else if (cmdMatch) {
                     const rawBody = cmdMatch[2] || '';
-                    const cleanCmd = rawBody.split(/\r?\n/).filter(line => {
+                    const cleanCmdRaw = rawBody.split(/\r?\n/).filter(line => {
                         const t = line.trim();
                         if (!t) return false;
                         if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
                         if (/^\s*(-\s*)?```/.test(line)) return false;
                         return true;
                     }).join('\n').trim();
+                    const cleanCmd = stripDsmlPollution(cleanCmdRaw);
 
                     if (cleanCmd && cleanCmd.length >= 2) {
                         const trackKey = cleanCmd;
@@ -1023,7 +1072,7 @@
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', cmd: normCmd.slice(0, 80) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.4', cmd: normCmd.slice(0, 80) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1049,6 +1098,18 @@
 
         console.log("[Agent Bridge] Dispatching command to native host:\n", command);
         noteAction('dispatch:' + String(command).slice(0, 60));
+
+        // v4.3.4 dangerous wildcard refusal (P3.7) — must run before the gate is consumed.
+        const rmRefusal = refuseDangerousWildcard(command);
+        if (rmRefusal) {
+            try { controller.setStatus('已拒绝：危险通配符', '#ef4444', false); } catch (_) {}
+            try { controller.setOutput(rmRefusal, true); } catch (_) {}
+            try { updateHUD('危险通配符已拦截', '#ef4444'); } catch (_) {}
+            isExecutingNow = false;
+            return;
+        }
+        try { pendingDispatch.set(controller.cardId, { sig: 'cmd:' + normCmd, at: Date.now() }); } catch (_) {}
+        try { lastDispatchAt = Date.now(); } catch (_) {}
 
         sendToNative({
             action: "execute",
@@ -1080,6 +1141,10 @@
 
         console.log(`[Agent Bridge] Dispatching file write to native host (Path: ${path}, ${content.length} chars)`);
         noteAction('filewrite:' + String(path).slice(0, 60));
+
+        // v4.3.4 write receipt correlation (P0.2/P1.3): expected bytes for read-back verify.
+        try { pendingDispatch.set(controller.cardId, { sig: 'write:' + String(path || '').trim() + ':' + (content ? content.length : 0), at: Date.now(), expectBytes: utf8len(content), expectPath: String(path || '') }); } catch (_) {}
+        try { lastDispatchAt = Date.now(); } catch (_) {}
 
         sendToNative({
             action: "write_file",
@@ -1483,6 +1548,14 @@
                 const c = cardControllers[data && data.id];
                 if (c && c.appendStream && typeof data.chunk === 'string') c.appendStream(data.chunk);
             } catch (_) {}
+            // v4.3.4 stream accumulation (P1.3): if the final result arrives empty
+            // but live chunks arrived, the receipt uses the accumulated stream text.
+            try {
+                if (data && data.id && typeof data.chunk === 'string') {
+                    streamBuf[data.id] = String(streamBuf[data.id] || '') + data.chunk;
+                    if (streamBuf[data.id].length > 200000) streamBuf[data.id] = streamBuf[data.id].slice(-200000);
+                }
+            } catch (_) {}
         },
         onDirectSendSuccess: function(cardId) {
             isExecutingNow = false;
@@ -1528,6 +1601,49 @@
             executingStartedAt = 0;
             const cardId = data.id;
             const exitCode = data.exitCode;
+            // v4.3.4 receipt integrity (P1.3): dispatch→result correlation + stream fallback.
+            // Unknown ids = stale replays: drop WITHOUT feedback (kills 错位/回放进会话).
+            const pend = pendingDispatch.get(cardId);
+            try { pendingDispatch.delete(cardId); } catch (_) {}
+            let streamedText = '';
+            try { streamedText = String(streamBuf[cardId] || ''); delete streamBuf[cardId]; } catch (_) {}
+            if (!String((data && data.output) || '').trim() && streamedText.trim()) {
+                try { data.output = streamedText.trim(); } catch (_) {}
+            }
+            const ctrl0 = cardControllers[cardId];
+            if (!pend && !data.__verified) {
+                try { pumpVirtual(); } catch (_) {}
+                if (!ctrl0) { try { console.log('[Agent Bridge] stale result dropped (no card, no dispatch)'); } catch (_) {} return; }
+                try { ctrl0.setStatus('过期回执已丢弃（非本次分发）', '#f59e0b', false); } catch (_) {}
+                try { updateHUD('过期回执已丢弃', '#f59e0b'); } catch (_) {}
+                isFeedbackPending = false;
+                feedbackPendingStartedAt = 0;
+                return;
+            }
+            if (!data.__verified && ctrl0 && (ctrl0.isFile || ctrl0.type === 'write_file') && exitCode === 0 && pend && pend.expectPath) {
+                // v4.3.4 write verify (P0.2): read back before claiming success (kills 静默截断).
+                try { ctrl0.setStatus('已写入，回读校验中…', '#0d9488', true); } catch (_) {}
+                const expBytes = pend.expectBytes || 0;
+                const expPath = pend.expectPath;
+                isFeedbackPending = false;
+                feedbackPendingStartedAt = 0;
+                try {
+                    window.__agentBridge.requestFileRead(expPath, function(res) {
+                        let gotBytes = -1, okMatch = false;
+                        try { gotBytes = (res && typeof res.size === 'number') ? res.size : -1; okMatch = !!(res && res.ok) && gotBytes === expBytes; } catch (_) {}
+                        if (okMatch) {
+                            window.__agentBridge.onCommandResult({ id: cardId, exitCode: 0, output: data.output, __verified: true });
+                        } else {
+                            const msg = '[写校验失败] 落盘 ' + gotBytes + ' 字节 ≠ 发送 ' + expBytes + ' 字节（疑似截断），拒绝报成功，请检查后重发。';
+                            try { diagAttach({ phase: 'write-verify-fail', path: String(expPath).slice(0, 80), got: gotBytes, exp: expBytes }); } catch (_) {}
+                            window.__agentBridge.onCommandResult({ id: cardId, exitCode: 1, output: String(data.output || '') + '\n' + msg, __verified: true });
+                        }
+                    }, 12000);
+                } catch (_) {
+                    window.__agentBridge.onCommandResult({ id: cardId, exitCode: exitCode, output: data.output, __verified: true });
+                }
+                return;
+            }
             try {
                 const _c = cardControllers[cardId];
                 if (_c && _c._tickIv) { clearInterval(_c._tickIv); _c._tickIv = null; }
@@ -2255,8 +2371,11 @@ ${output}
                 if (Date.now() < rateLimitBackoffUntil) return; // still cooling
                 // Expired: retry once, then clear and resume.
                 rateLimitBackoffUntil = 0;
+                // v4.3.4 staleness guard (P1.3): never re-inject feedback older than the
+                // latest dispatch — a newer command means this retry is a stale replay.
                 if (!backoffRetried && lastFeedbackForRetry.text &&
-                    Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000) {
+                    Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000 &&
+                    lastFeedbackForRetry.at >= lastDispatchAt) {
                     backoffRetried = true;
                     updateHUD('冷却结束，重发上一条反馈…', '#2563eb');
                     try { diagAttach({ phase: 'rate-limit-retry' }); } catch (_) {}
