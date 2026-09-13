@@ -781,6 +781,7 @@
         updateHUD("正在执行本地指令...", "#f59e0b");
 
         console.log("[Agent Bridge] Dispatching command to native host:\n", command);
+        noteAction('dispatch:' + String(command).slice(0, 60));
 
         sendToNative({
             action: "execute",
@@ -809,6 +810,7 @@
         updateHUD("正在写入本地文件...", "#0d9488");
 
         console.log(`[Agent Bridge] Dispatching file write to native host (Path: ${path}, ${content.length} chars)`);
+        noteAction('filewrite:' + String(path).slice(0, 60));
 
         sendToNative({
             action: "write_file",
@@ -1279,7 +1281,8 @@ ${output}
 
 请阅读并分析上述附件内容，继续进行下一步判断或直接给出回答。`;
             } else {
-                feedback = `[Tool Call Result (Exit: ${exitCode})]:
+                const notePreamble = data.prompt ? `${data.prompt}\n\n` : "";
+                feedback = `${notePreamble}[Tool Call Result (Exit: ${exitCode})]:
 \`\`\`
 ${output}
 \`\`\`
@@ -1310,6 +1313,7 @@ ${output}
                 // send's completion request has left (or fallback timeout).
                 queueFeedbackSlot((release) => {
                     try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
+                    noteAction('send-feedback');
                     const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
                     updateHUD(hudMsg, "#2563eb");
 
@@ -1853,10 +1857,47 @@ ${output}
     });
 
     setInterval(() => {
-        createFloatingHUD();
-        scanAndProcessToolCalls();
-        collapseToolFeedbackBubbles();
-    }, 600);
+        try {
+            if (document.hidden) return; // background tab: don't burn CPU scanning
+            createFloatingHUD();
+            scanAndProcessToolCalls();
+            collapseToolFeedbackBubbles();
+        } catch (_) {}
+    }, 1500);
+
+    // Crash-page forensics: when the site's tamper/crash whale appears, snapshot
+    // our footprint so we stop guessing which modification trips it.
+    let crashReported = false;
+    let lastAgentAction = 'init';
+    function noteAction(s) { try { lastAgentAction = (s || '').slice(0, 80); } catch (_) {} }
+    setInterval(() => {
+        try {
+            if (!document.body) return;
+            const t = document.body.innerText || '';
+            if (t.length > 50 && /may have crashed due to modifications/i.test(t)) {
+                if (crashReported) return;
+                crashReported = true;
+                let ours = {};
+                try {
+                    ours = {
+                        hud: document.querySelectorAll('[id^="agent-"]').length,
+                        cards: document.querySelectorAll('.agent-tool-card').length,
+                        pills: document.querySelectorAll('.agent-collapsed-pill').length,
+                        panel: document.querySelectorAll('#agent-direct-panel').length,
+                        totalNodes: document.querySelectorAll('*').length
+                    };
+                } catch (_) {}
+                sendToNative({
+                    action: 'crashwatch',
+                    url: location.href,
+                    lastAction: lastAgentAction,
+                    ours: JSON.stringify(ours)
+                });
+            } else if (crashReported && t.length > 50 && !/may have crashed due to modifications/i.test(t)) {
+                crashReported = false; // recovered (reload), re-arm
+            }
+        } catch (_) {}
+    }, 5000);
 
     // Rate-limit watcher: the site refuses burst sends ("Messages too frequent")
     // with HTTP 200 + an error bubble, so request-left checks can't see it.

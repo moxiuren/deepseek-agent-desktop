@@ -460,7 +460,6 @@ namespace DeepSeek
                 {
                     // Attachment-readiness signal diagnostics (dev only, dropped in trial builds)
                     if (!App.DiagnosticsEnabled) return;
-                    // Attachment-readiness signal diagnostics (local log only)
                     var parts = new System.Collections.Generic.List<string>();
                     foreach (var prop in root.EnumerateObject())
                     {
@@ -468,6 +467,14 @@ namespace DeepSeek
                         parts.Add($"{prop.Name}={prop.Value}");
                     }
                     App.Log($"[ATTACHDIAG] {string.Join(" ", parts)}");
+                }
+                else if (action == "crashwatch")
+                {
+                    // Site tamper/crash page forensics (always logged, even in trial builds)
+                    string url = root.TryGetProperty("url", out var cu) ? (cu.GetString() ?? "") : "";
+                    string lastAction = root.TryGetProperty("lastAction", out var la) ? (la.GetString() ?? "") : "";
+                    string ours = root.TryGetProperty("ours", out var o) ? o.GetString() ?? "" : "";
+                    App.Log($"[CRASHWATCH] whale page visible url={url} lastAction={lastAction} ours={ours}");
                 }
                 else if (action == "apisniff")
                 {
@@ -1080,11 +1087,22 @@ namespace DeepSeek
                     if (File.Exists(filePath))
                     {
                         byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
-                        string b64 = Convert.ToBase64String(fileBytes);
-                        string filename = Path.GetFileName(filePath);
-                        string mime = GetMimeType(Path.GetExtension(filePath));
+                        if (fileBytes.Length <= MaxUploadBytes)
+                        {
+                            string b64 = Convert.ToBase64String(fileBytes);
+                            string filename = Path.GetFileName(filePath);
+                            string mime = GetMimeType(Path.GetExtension(filePath));
 
-                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt);
+                            await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt);
+                        }
+                        else
+                        {
+                            // Too big to upload: keep on local disk, reference by path.
+                            string fullText = File.Exists(filePath) ? await File.ReadAllTextAsync(filePath, Encoding.UTF8) : "";
+                            var (fbOut, fbPrompt, _) = await HandleOversizedOutputAsync(string.IsNullOrEmpty(fullText) ? output : fullText);
+                            string note = prompt + "\n\n" + fbPrompt;
+                            await FeedResultBackAsync(id, exitCode, fbOut, isAttachment: false, prompt: note);
+                        }
                         return;
                     }
                 }
@@ -1092,14 +1110,23 @@ namespace DeepSeek
                 // 2. Check for oversized terminal output (> 6000 chars) -> auto package as attachment!
                 if (output.Length > 6000)
                 {
-                    string tempFile = Path.Combine(Path.GetTempPath(), $"agent_output_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.txt");
-                    await File.WriteAllTextAsync(tempFile, output, Encoding.UTF8);
-                    byte[] fileBytes = await File.ReadAllBytesAsync(tempFile);
-                    string b64 = Convert.ToBase64String(fileBytes);
-                    string filename = Path.GetFileName(tempFile);
-                    string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
+                    int bytesLen = Encoding.UTF8.GetByteCount(output);
+                    if (bytesLen <= MaxUploadBytes)
+                    {
+                        string tempFile = Path.Combine(Path.GetTempPath(), $"agent_output_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.txt");
+                        await File.WriteAllTextAsync(tempFile, output, Encoding.UTF8);
+                        byte[] fileBytes = await File.ReadAllBytesAsync(tempFile);
+                        string b64 = Convert.ToBase64String(fileBytes);
+                        string filename = Path.GetFileName(tempFile);
+                        string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
 
-                    await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt);
+                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt);
+                    }
+                    else
+                    {
+                        var (fbOut, fbPrompt, _) = await HandleOversizedOutputAsync(output);
+                        await FeedResultBackAsync(id, exitCode, fbOut, isAttachment: false, prompt: fbPrompt);
+                    }
                     return;
                 }
 
@@ -1128,6 +1155,28 @@ namespace DeepSeek
                 LiveStreamCmdlet.Sink = null;
                 if (gateTaken) { try { _execGate.Release(); } catch {} }
             }
+        }
+
+        // DeepSeek's frontend React ErrorBoundary crashes when rendering uploaded
+        // attachments near ~10MB (shows the extension "whale" page). Cap uploads.
+        private const int MaxUploadBytes = 5 * 1024 * 1024;
+
+        // Shared helper: keeps huge payloads off the site (crashes its renderer) by
+        // writing them to the local Projects dir and returning a head+tail summary.
+        private async Task<(string FeedbackOutput, string Prompt, string? LocalPath)> HandleOversizedOutputAsync(string output)
+        {
+            string localDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Projects");
+            Directory.CreateDirectory(localDir);
+            string localPath = Path.Combine(localDir, $"agent_output_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.txt");
+            await File.WriteAllTextAsync(localPath, output, Encoding.UTF8);
+            double mb = Math.Round(Encoding.UTF8.GetByteCount(output) / 1048576.0, 1);
+            string head = output.Substring(0, Math.Min(4000, output.Length));
+            string tail = output.Length > 4000 ? output.Substring(output.Length - 4000) : "";
+            string note = $"终端输出过大（共 {output.Length} 字符 / {mb} MB），为避免站点附件渲染崩溃，未走附件上传；完整内容已写入本地文件：\n{localPath}\n\n需要分析时请先用终端命令读取或过滤该文件（如 Get-Content -TotalCount 2000 或 Select-String），不要一次性整读。";
+            string summary = tail.Length > 0
+                ? head + "\n\n...[中间 " + (output.Length - 8000) + " 字符省略，完整内容见本地文件]...\n\n" + tail
+                : head;
+            return (summary, note, localPath);
         }
 
         private async Task FeedResultBackAsync(
@@ -1257,7 +1306,8 @@ namespace DeepSeek
             }
             else
             {
-                feedbackPrompt = $"[Tool Call Result (Exit: {exitCode})]:\n```\n{output}\n```\n请根据上述终端执行结果继续。若需继续执行请输出 ```local_cmd 代码块，若全部完成请给出最终解答。";
+                string note = string.IsNullOrEmpty(prompt) ? "" : prompt + "\n\n";
+                feedbackPrompt = $"{note}[Tool Call Result (Exit: {exitCode})]:\n```\n{output}\n```\n请根据上述终端执行结果继续。若需继续执行请输出 ```local_cmd 代码块，若全部完成请给出最终解答。";
             }
 
             return await _apiClient.SendCompletionDirectAsync(sessionId, parentMsgId, feedbackPrompt, refFileIds, token);
