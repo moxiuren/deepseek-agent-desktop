@@ -3,7 +3,7 @@
 ; NOTE: run a fresh `dotnet publish ... -o ..\publish` first so ..\publish is current.
 
 #define MyAppName "DeepSeek Agent"
-#define MyAppVersion "1.0.4"
+#define MyAppVersion "1.0.5"
 #define MyAppPublisher "moxiuren"
 #define MyAppExeName "DeepSeek.exe"
 #define SrcDir "..\publish"
@@ -18,7 +18,7 @@ DefaultDirName={localappdata}\DeepSeek-Agent
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\..\dist
-OutputBaseFilename=DeepSeek-Agent-Setup-1.0.4
+OutputBaseFilename=DeepSeek-Agent-Setup-1.0.5
 SetupIconFile=..\AppIcon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
@@ -53,6 +53,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; DSX plugin runtime (built-in hot-load plugin system)
 Source: "..\runtime\plugin-loader.js"; DestDir: "{app}\runtime"; Flags: ignoreversion
+; DSX default plugins (whale/hello-panel/file-path-drop) -> user docs on FIRST install only;
+; reinstall/upgrade keeps user's hot-reloaded copies (`onlyifdoesntexist`)
+Source: "{#SrcDir}\plugins\*"; DestDir: "{userdocs}\DeepSeek-Agent\plugins"; Flags: ignoreversion onlyifdoesntexist recursesubdirs createallsubdirs
 ; Bundled offline prereqs (extracted to temp only when needed)
 Source: "{#PrereqDir}\windowsdesktop-runtime.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall nocompression
 Source: "{#PrereqDir}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall nocompression
