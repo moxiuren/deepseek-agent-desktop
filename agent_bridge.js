@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.1 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -63,7 +63,7 @@
 \`\`\`
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
-【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。
+【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律三条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
 请确认收到，并等待用户指令。`;
 
@@ -148,6 +148,32 @@
             else if (ch === "'" && !inDouble) inSingle = !inSingle;
         }
         return !inDouble && !inSingle;
+    }
+
+    function isBracketBalanced(cmd) {
+        // v4.1: 与 isQuoteBalanced 同哲学——只做"等待"门，不做硬拒绝。
+        // 跳过单/双引号串（含 PowerShell 反引号转义）与 # 行注释，只核 ()[]{} 配对+类型。
+        const pairs = { ')': '(', ']': '[', '}': '{' };
+        const stack = [];
+        let inDouble = false, inSingle = false, escaped = false;
+        const lines = String(cmd || '').split('\n');
+        for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            for (let i = 0; i < line.length; i++) {
+                const ch = line[i];
+                if (escaped) { escaped = false; continue; }
+                if (ch === '`') { escaped = true; continue; }
+                if (!inSingle && !inDouble && ch === '#') break;
+                if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
+                if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
+                if (inSingle || inDouble) continue;
+                if (ch === '(' || ch === '[' || ch === '{') stack.push(ch);
+                else if (ch === ')' || ch === ']' || ch === '}') {
+                    if (!stack.length || stack.pop() !== pairs[ch]) return false;
+                }
+            }
+        }
+        return stack.length === 0 && !inDouble && !inSingle;
     }
 
     const style = document.createElement('style');
@@ -430,6 +456,13 @@
         }
 
         let content = lines.join('\n');
+        // v4.1: BOM(U+FEFF, 下行正则内为不可见字符) + 界面残留行清理（codeEl 路径此前零过滤，UI 文本会直接进文件体）。
+        content = content.replace(/^﻿/, '');
+        const residueRe = /^(Copy|Download|复制|下载)$/;
+        let cl = content.split(/\r?\n/);
+        while (cl.length && (cl[0].trim() === '' || residueRe.test(cl[0].trim()))) cl.shift();
+        while (cl.length && (cl[cl.length - 1].trim() === '' || residueRe.test(cl[cl.length - 1].trim()))) cl.pop();
+        content = cl.join('\n');
         // Clean single leading newline if created by splicing first line
         content = content.replace(/^\r?\n/, '');
         return content;
@@ -712,8 +745,15 @@
                 continue;
             }
 
-            if (!isFileWrite && !isQuoteBalanced(cleanCmd)) {
-                console.log("[Agent Bridge] Waiting for closed quotes:\n", cleanCmd);
+            if (!isFileWrite && (!isQuoteBalanced(cleanCmd) || !isBracketBalanced(cleanCmd))) {
+                console.log("[Agent Bridge] Waiting for balanced quotes/brackets:\n", cleanCmd);
+                continue;
+            }
+
+            // v4.1: 空文件内容直接吞掉（此前送 DLL 必被拒 Exit:1 → 模型重发空块死循环，见 2026-09-13 #3/#7）。
+            // 不标记 processed：流式补全中会自动进入；永远空则永远不执行、零噪音。
+            if (isFileWrite && (!fileContent || !fileContent.trim())) {
+                console.log("[Agent Bridge] Empty file content, skip (no-exec, no-feedback): " + (fileInfo && fileInfo.path));
                 continue;
             }
 
@@ -1164,6 +1204,43 @@
                     disabled: isControlDisabled(b),
                     rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
                 };
+            }
+        },
+        onFileReadResult: function(data) {
+            try {
+                const reqId = data && data.reqId;
+                if (!reqId) return;
+                const subs = window.__dsxFileReadSubs || {};
+                const cb = subs[reqId];
+                if (typeof cb === "function") {
+                    try { cb(data); } catch (e) { console.error("[agent_bridge] onFileReadResult cb error:", e); }
+                    delete subs[reqId];
+                }
+            } catch (e) { console.error("[agent_bridge] onFileReadResult error:", e); }
+        },
+        requestFileRead: function(path, callback, timeoutMs) {
+            try {
+                if (typeof path !== "string" || !path) {
+                    if (typeof callback === "function") callback({ ok: false, error: "path empty" });
+                    return null;
+                }
+                const reqId = "read-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+                window.__dsxFileReadSubs = window.__dsxFileReadSubs || {};
+                window.__dsxFileReadSubs[reqId] = callback;
+                sendToNative({ action: "read_file", path: path, reqId: reqId });
+                if (typeof timeoutMs === "number" && timeoutMs > 0) {
+                    setTimeout(function() {
+                        const s = window.__dsxFileReadSubs || {};
+                        if (s[reqId]) {
+                            delete s[reqId];
+                            if (typeof callback === "function") callback({ ok: false, error: "timeout" });
+                        }
+                    }, timeoutMs);
+                }
+                return reqId;
+            } catch (e) {
+                if (typeof callback === "function") callback({ ok: false, error: String(e && e.message || e) });
+                return null;
             }
         },
         insertText: function(text) {
