@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.2 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.3 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -69,7 +69,9 @@
 
     let autoExecute = true;
     let isExecutingNow = false;
+    let isFeedbackPending = false;
     let executingStartedAt = 0;
+    let feedbackPendingStartedAt = 0;
     // Last dispatch signature for duplicate merging.
     let lastDispatch = { cmd: '', at: 0 };
     // Serializes feedback sends: each feedback fills+clicks only after the
@@ -129,6 +131,16 @@
     // Processed/collapsed tracking lives in WeakSets, NOT data-* attributes,
     // so our bookkeeping leaves no DOM fingerprints.
     const processedBlocks = new WeakSet();
+    const processedSignatures = new Set();
+    function addProcessedSig(sig) {
+        if (!sig) return;
+        if (processedSignatures.size > 200) {
+            const arr = Array.from(processedSignatures);
+            processedSignatures.clear();
+            arr.slice(-100).forEach(s => processedSignatures.add(s));
+        }
+        processedSignatures.add(sig);
+    }
     const collapsedBubblesSet = new WeakSet();
     // Hide our window globals from enumeration (Object.keys/for-in).
     function hideGlobal(name) {
@@ -668,6 +680,14 @@
             const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown');
             for (let i = containers.length - 1; i >= 0; i--) {
                 const c = containers[i];
+                // STRICTLY skip thinking/reasoning scratchpads (DeepSeek-R1 CoT)
+                try {
+                    if (c.closest && c.closest('.ds-think-content, [class*="think"], [class*="thought"], [data-testid*="think"]')) {
+                        continue;
+                    }
+                    if (c.className && /think|thought/i.test(String(c.className))) continue;
+                } catch (_) {}
+
                 let t = '';
                 try { t = c.textContent || ''; } catch (_) {}
                 const isAssistant = (c.classList && c.classList.contains('ds-assistant-message-main-content')) ||
@@ -685,10 +705,12 @@
                     hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
                               /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
                     // Check if ALL code blocks inside this container are already processed
-                    const pBlocks = c.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
+                    const pBlocks = c.querySelectorAll('.md-code-block, pre:not(.md-code-block pre)');
                     let allProcessed = (pBlocks.length > 0);
                     for (let pb of pBlocks) {
-                        if (!processedBlocks.has(pb)) { allProcessed = false; break; }
+                        const pCode = (pb.innerText || '').trim();
+                        const sig = 'cmd:' + pCode.replace(/\s+/g, ' ').trim();
+                        if (!processedBlocks.has(pb) && !processedSignatures.has(sig)) { allProcessed = false; break; }
                     }
                     ownUi = allProcessed && !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card');
                 } catch (_) {}
@@ -701,7 +723,7 @@
 
     // 3. Scanner with Debounce & Quote Verification
     function scanAndProcessToolCalls() {
-        if (isExecutingNow) return;
+        if (isExecutingNow || isFeedbackPending) return;
 
         const blocks = document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
         const now = Date.now();
@@ -713,6 +735,13 @@
         let foundAny = false;
 
         for (let el of blocks) {
+            // STRICTLY skip any code blocks inside thinking/reasoning scratchpads
+            try {
+                if (el.closest && el.closest('.ds-think-content, [class*="think"], [class*="thought"], [data-testid*="think"]')) {
+                    continue;
+                }
+            } catch (_) {}
+
             if (processedBlocks.has(el)) continue;
 
             const parent = el.closest('.md-code-block, [class*="code-block"]:not([class*="banner"]):not([class*="header"]), [class*="codeBlock"]') || el;
@@ -778,14 +807,24 @@
             let cleanCmd = "";
             let fileContent = "";
             let trackKey = "";
+            let signature = "";
 
             if (isFileWrite) {
                 fileContent = extractFileContent(parent, fileInfo);
                 trackKey = fileInfo.path + "::" + fileContent;
+                signature = 'write:' + fileInfo.path + ':' + fileContent.length;
             } else {
                 cleanCmd = extractPureCommand(parent);
                 if (!cleanCmd || cleanCmd.length < 2) continue;
                 trackKey = cleanCmd;
+                signature = 'cmd:' + cleanCmd.replace(/\s+/g, ' ').trim();
+            }
+
+            // Anti-duplicate: if this exact signature was already processed, skip re-execution across React re-renders!
+            if (processedSignatures.has(signature)) {
+                processedBlocks.add(el);
+                processedBlocks.add(parent);
+                continue;
             }
 
             // Debounce (dual-keyed: DOM node identity + content signature to survive React re-renders)
@@ -836,6 +875,8 @@
 
             processedBlocks.add(el);
             processedBlocks.add(parent);
+            if (scanScope) processedBlocks.add(scanScope);
+            addProcessedSig(signature);
             blockWatchMap.delete(parent);
             cmdWatchMap.delete(trackKey);
 
@@ -866,12 +907,23 @@
 
         // v4.3.1: scanScope 文本兜底（当渲染器不产 pre/code-block 节点，或处于未解析原始围栏时）
         if (!foundAny && scanScope && !processedBlocks.has(scanScope)) {
+            // STRICTLY skip thinking/reasoning scratchpads
+            try {
+                if (scanScope.closest && scanScope.closest('.ds-think-content, [class*="think"], [class*="thought"], [data-testid*="think"]')) return;
+                if (scanScope.className && /think|thought/i.test(String(scanScope.className))) return;
+            } catch (_) {}
+
             let isOwn = false;
             try {
                 isOwn = !!scanScope.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
             } catch (_) {}
+            if (isOwn) {
+                processedBlocks.add(scanScope);
+                return;
+            }
+
             const scopeText = (scanScope.innerText || scanScope.textContent || '');
-            if (!isOwn && !scopeText.includes('[Tool Call')) {
+            if (!scopeText.includes('[Tool Call')) {
                 const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
                 const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
 
@@ -884,6 +936,11 @@
                     const fileContent = writeMatch[2] || '';
                     if (targetPath && fileContent.trim()) {
                         const trackKey = targetPath + "::" + fileContent;
+                        const sig = 'write:' + targetPath + ':' + fileContent.length;
+                        if (processedSignatures.has(sig)) {
+                            processedBlocks.add(scanScope);
+                            return;
+                        }
                         let tracker = blockWatchMap.get(scanScope);
                         if (!tracker) {
                             tracker = { text: trackKey, lastChange: now };
@@ -893,6 +950,7 @@
                             tracker.lastChange = now;
                         } else if (now - tracker.lastChange >= 1800) {
                             processedBlocks.add(scanScope);
+                            addProcessedSig(sig);
                             blockWatchMap.delete(scanScope);
                             console.log(`[Agent Bridge] [Scope Fallback] Complete File Write Detected: ${targetPath} (${fileContent.length} chars)`);
                             const controller = renderToolCallCard(scanScope, fileContent, (content, ctrl) => {
@@ -916,6 +974,11 @@
 
                     if (cleanCmd && cleanCmd.length >= 2) {
                         const trackKey = cleanCmd;
+                        const sig = 'cmd:' + cleanCmd.replace(/\s+/g, ' ').trim();
+                        if (processedSignatures.has(sig)) {
+                            processedBlocks.add(scanScope);
+                            return;
+                        }
                         let tracker = blockWatchMap.get(scanScope);
                         if (!tracker) {
                             tracker = { text: trackKey, lastChange: now };
@@ -928,6 +991,7 @@
                                 const isHtml = /<[a-zA-Z][^>]*>/.test(cleanCmd) && /<\/(div|span|style|html|body)>|vcp-root/i.test(cleanCmd);
                                 if (!isHtml) {
                                     processedBlocks.add(scanScope);
+                                    addProcessedSig(sig);
                                     blockWatchMap.delete(scanScope);
                                     console.log("[Agent Bridge] [Scope Fallback] Complete Tool Call Detected:\n", cleanCmd);
                                     const controller = renderToolCallCard(scanScope, cleanCmd, (cmd, ctrl) => {
@@ -958,6 +1022,7 @@
         // Normalized: re-renders may differ in whitespace only.
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
+        addProcessedSig('cmd:' + normCmd);
         try { diagAttach({ phase: 'dispatch', cmd: normCmd.slice(0, 80) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
@@ -998,6 +1063,7 @@
 
         const nowMs = Date.now();
         const sig = 'write_file:' + String(path || '').trim();
+        addProcessedSig('write:' + String(path || '').trim() + ':' + (content ? content.length : 0));
         if (sig === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复写入已合并（5s内相同目标）', '#8b5cf6', false);
             controller.setOutput('相同目标文件的写入在短时间内重复下发，已自动合并。');
@@ -1420,6 +1486,8 @@
         },
         onDirectSendSuccess: function(cardId) {
             isExecutingNow = false;
+            isFeedbackPending = false;
+            feedbackPendingStartedAt = 0;
             executingStartedAt = 0;
             try {
                 const c = cardControllers[cardId];
@@ -1455,6 +1523,8 @@
         },
         onCommandResult: function(data) {
             isExecutingNow = false;
+            isFeedbackPending = true; // Protect pacing countdown window from duplicate scans
+            feedbackPendingStartedAt = Date.now();
             executingStartedAt = 0;
             const cardId = data.id;
             const exitCode = data.exitCode;
@@ -1542,6 +1612,8 @@ ${output}
             }
 
             function sendFeedbackNow() {
+                isFeedbackPending = false;
+                feedbackPendingStartedAt = 0;
                 if (controller) controller.hidePacing();
                 // Serialize on the send slot: fill+click only after the previous
                 // send's completion request has left (or fallback timeout).
@@ -2092,11 +2164,17 @@ ${output}
 
     setInterval(() => {
         try {
-            // Watchdog: clear wedged execution lock if native execution exceeded 125s
-            if (isExecutingNow && executingStartedAt > 0 && Date.now() - executingStartedAt > 125000) {
-                console.warn('[Agent Bridge] isExecutingNow watchdog: cleared wedged execution lock (>125s)');
+            // Watchdog: clear wedged execution lock if native execution exceeded 190s (C# timeout is 180s)
+            if (isExecutingNow && executingStartedAt > 0 && Date.now() - executingStartedAt > 190000) {
+                console.warn('[Agent Bridge] isExecutingNow watchdog: cleared wedged execution lock (>190s)');
                 isExecutingNow = false;
                 executingStartedAt = 0;
+            }
+            // Watchdog: clear stuck feedback pending lock if countdown/send exceeded 35s
+            if (isFeedbackPending && feedbackPendingStartedAt > 0 && Date.now() - feedbackPendingStartedAt > 35000) {
+                console.warn('[Agent Bridge] isFeedbackPending watchdog: cleared stuck feedback lock (>35s)');
+                isFeedbackPending = false;
+                feedbackPendingStartedAt = 0;
             }
             createFloatingHUD();
             scanAndProcessToolCalls();
