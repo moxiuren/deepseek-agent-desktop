@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.1 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.2 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -747,6 +747,13 @@
 
             if (!isFileWrite && (!isQuoteBalanced(cleanCmd) || !isBracketBalanced(cleanCmd))) {
                 console.log("[Agent Bridge] Waiting for balanced quotes/brackets:\n", cleanCmd);
+                continue;
+            }
+
+            // v4.2: HTML 内容绝不送执行（vcp-root/HTML 卡片文本曾多次被误当命令跑，用户 2026-09-13 拍板下掉整条线）。
+            // 只拦 local_cmd 分支；要求"含 HTML 标签 + 闭合标签/vcp-root"双条件，正常命令误伤率≈0。
+            if (!isFileWrite && /<[a-zA-Z][^>]*>/.test(cleanCmd) && /<\/(div|span|style|html|body)>|vcp-root/i.test(cleanCmd)) {
+                console.log("[Agent Bridge] HTML-looking content, skip execution (no-exec, no-feedback).");
                 continue;
             }
 
