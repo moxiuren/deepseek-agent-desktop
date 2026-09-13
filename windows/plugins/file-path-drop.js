@@ -1,25 +1,11 @@
-/* DSX 插件: file-path-drop
- * 目标: 像终端一样把文件"拼贴"成完整路径插入聊天输入框。
- *
- * 背景(实测): 客户端原生实现了两条链路, 但触发端都断了 —
- *   - WPF Window 的 PreviewDrop: WebView2(HwndHost) 占满窗口, 收不到 drop;
- *   - ComponentDispatcher 的 Ctrl+V 分支: 源码注释明示 WebView2 原生窗口绕过
- *     WPF dispatcher pump, 页面有焦点时 ComponentDispatcher 看不到按键;
- *   - 页面层 drop 事件: 实测零事件到达(探针 40s 无 dragenter/drop)。
- *   而原生处理函数本身完好: webMessage {action:"test_clipboard_paste"}
- *   -> Clipboard.ContainsFileDropList -> FormatPathsForTerminal -> insertText,
- *   已实测插入 `C:\...\hosts "C:\Program Files\...\oledb32.dll"` 成功。
- *
- * 本插件补齐触发端: 页面捕获 Ctrl+V / Shift+Insert -> 通知原生层处理剪贴板文件。
- * 剪贴板若无文件, 原生层直接返回, 不影响普通文本粘贴(故不 preventDefault)。
- */
+/* DSX 插件: file-path-drop - 路径拼贴 + 上传误报屏蔽 (v3: 轮询替代 observe 规避早期注入坑) */
 module.exports = {
   onLoad: function (ctx, meta) {
     function post(msg) {
       try {
         var wv = window.chrome && window.chrome.webview;
         if (wv && typeof wv.postMessage === 'function') { wv.postMessage(msg); return true; }
-      } catch (e) { ctx.error('postMessage 失败: ' + e.message); }
+      } catch (e) { ctx.error('postMessage fail: ' + e.message); }
       return false;
     }
     var lastAt = 0;
@@ -30,15 +16,27 @@ module.exports = {
       var isShiftIns = e.shiftKey && (k === 'Insert' || code === 45);
       if (!isCtrlV && !isShiftIns) return;
       var now = Date.now();
-      if (now - lastAt < 300) return;   // 去抖
+      if (now - lastAt < 300) return;
       lastAt = now;
-      if (post({ action: 'test_clipboard_paste' })) {
-        ctx.log('已请求原生层处理剪贴板文件路径 (Ctrl+V / Shift+Insert)');
-      }
+      if (post({ action: 'test_clipboard_paste' })) { ctx.log('clipboard paste -> native'); }
     }
-    // 捕获阶段监听, 确保先于页面其它处理
     var offKey = ctx.on(window, 'keydown', onKey, true);
-    // 附带: 若页面层真的收到 drop(某些环境 AllowExternalDrop 行为不同), 兜底处理
+    function onPaste(e) {
+      var dt = e.clipboardData;
+      if (!dt) return;
+      var hasFile = false;
+      try {
+        if (dt.files && dt.files.length) hasFile = true;
+        if (!hasFile && dt.types) {
+          for (var i = 0; i < dt.types.length; i++) { if (dt.types[i] === 'Files') { hasFile = true; break; } }
+        }
+      } catch (err) {}
+      if (!hasFile) return;
+      e.preventDefault();
+      e.stopPropagation();
+      ctx.log('blocked page paste upload');
+    }
+    var offPaste = ctx.on(document, 'paste', onPaste, true);
     function toWinPath(uri) {
       var s = String(uri).trim();
       if (!s) return '';
@@ -72,12 +70,25 @@ module.exports = {
         d.set.call(ta, cur + text);
         ta.selectionStart = ta.selectionEnd = pos + text.length;
         ta.dispatchEvent(new Event('input', { bubbles: true }));
-        ctx.log('drop 兜底插入: ' + text);
+        ctx.log('drop fallback insert');
       }
     }
     var offDrop = ctx.on(document, 'drop', onDrop, true);
-    this._c = function () { offKey(); offDrop(); };
-    ctx.log('file-path-drop 已挂载 (Ctrl+V / Shift+Insert -> 原生剪贴板文件路径插入)');
+    var NEEDLE = 'uploaded file format is not supported';
+    function sweepToasts() {
+      try {
+        var nodes = document.querySelectorAll('.ds-toast-container > *');
+        for (var i = nodes.length - 1; i >= 0; i--) {
+          var n = nodes[i];
+          var t = (n.textContent || '').toLowerCase();
+          if (t.indexOf(NEEDLE) !== -1) { try { n.remove(); ctx.log('toast suppressed'); } catch (e) {} }
+        }
+      } catch (err) {}
+    }
+    sweepToasts();
+    var timerId = ctx.every(250, sweepToasts);
+    this._c = function () { offKey(); offPaste(); offDrop(); if (timerId) { try { clearInterval(timerId); } catch (e) {} } };
+    ctx.log('file-path-drop loaded v3 (poll-based)');
   },
   onUnload: function () { if (this._c) this._c(); }
 };
