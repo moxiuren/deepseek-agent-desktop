@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.4 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -112,6 +112,49 @@
             }, 200);
         }));
         return feedbackChain;
+    }
+    // v4.4: 会话亲和性（SPA 切会话不重载文档，反馈必须回到发起会话，绝不串会话）。
+    function currentSessionId() {
+        try {
+            const m = String(location.href || '').match(/\/a\/chat\/s\/([0-9a-f-]{36})/i);
+            return m ? m[1].toLowerCase() : 'unknown';
+        } catch (_) { return 'unknown'; }
+    }
+    function shortSid(s) { try { return String(s || '').slice(0, 8); } catch (_) { return '?'; } }
+    const cardSessionById = {};
+    let heldFeedback = {};
+    let lastSeenSession = null;
+    function holdFeedback(sid, text) {
+        try {
+            if (!sid || sid === 'unknown' || !text) return;
+            if (!heldFeedback[sid]) heldFeedback[sid] = [];
+            heldFeedback[sid].push({ text: String(text), at: Date.now() });
+            if (heldFeedback[sid].length > 20) heldFeedback[sid].shift();
+            console.log('[Agent Bridge] Feedback held for session ' + shortSid(sid) + ' (queue=' + heldFeedback[sid].length + ')');
+        } catch (_) {}
+    }
+    function flushHeld(sid) {
+        try {
+            const q = heldFeedback[sid];
+            if (!q || !q.length) return;
+            heldFeedback[sid] = [];
+            updateHUD('正在补发该会话结果 (' + q.length + ' 条)…', '#2563eb');
+            q.forEach((item) => {
+                queueFeedbackSlot((release) => {
+                    try {
+                        const cur = currentSessionId();
+                        if (cur && cur !== 'unknown' && cur !== sid) {
+                            holdFeedback(sid, item.text);
+                            try { release(true); } catch (_) {}
+                            return;
+                        }
+                    } catch (_) {}
+                    try { injectPrompt(item.text, true); } catch (_) {}
+                    try { burstCollapse(); } catch (_) {}
+                    try { release(true); } catch (_) {}
+                });
+            });
+        } catch (_) {}
     }
     // Timestamp (ms) of the last successful injectFileToChat, for upload correlation.
     let __attachInjectedAt = 0;
@@ -807,6 +850,7 @@
     // 4. Execute Command via Native Swift / Host
     function executeCommand(command, controller) {
         if (isExecutingNow) return;
+        try { if (controller && controller.cardId) cardSessionById[controller.cardId] = currentSessionId(); } catch (_) {}
 
         // Dispatch dedup: streaming re-renders can surface the same block twice
         // (observed 62ms apart) — two feedback flows then stomp the composer and
@@ -850,6 +894,7 @@
     // 4b. Direct File Write via Native Host
     function executeFileWrite(path, content, controller) {
         if (isExecutingNow) return;
+        try { if (controller && controller.cardId) cardSessionById[controller.cardId] = currentSessionId(); } catch (_) {}
 
         const nowMs = Date.now();
         const sig = 'write_file:' + String(path || '').trim();
@@ -1406,7 +1451,18 @@ ${output}
                 // Serialize on the send slot: fill+click only after the previous
                 // send's completion request has left (or fallback timeout).
                 queueFeedbackSlot((release) => {
-                    try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
+                    // v4.4: 会话亲和门——当前会话不是发起会话则暂存，切回再发。
+                    try {
+                        const tgt = (controller && controller.cardId && cardSessionById[controller.cardId]) || null;
+                        const cur = currentSessionId();
+                        if (tgt && cur && cur !== 'unknown' && tgt !== cur) {
+                            holdFeedback(tgt, feedback);
+                            updateHUD('会话 ' + shortSid(tgt) + ' 有结果待投递（当前在别的会话），切回去自动发送', '#f59e0b');
+                            try { release(true); } catch (_) {}
+                            return;
+                        }
+                    } catch (_) {}
+                    try { lastFeedbackForRetry = { text: feedback, at: Date.now(), sid: currentSessionId() }; backoffRetried = false; } catch (_) {}
                     noteAction('send-feedback');
                     const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
                     updateHUD(hudMsg, "#2563eb");
@@ -2026,19 +2082,36 @@ ${output}
             console.error('[Agent Bridge] rate limited (' + source + '), backing off 90s');
         } catch (_) {}
     }
-    setInterval(() => {
-        try {
-            if (rateLimitBackoffUntil > 0) {
+        setInterval(() => {
+            // v4.4: 会话切换嗅探——切回有暂存的会话即补发（复用既有 1s 心跳，不新增定时器）。
+            try {
+                const sidNow = currentSessionId();
+                if (lastSeenSession === null) { lastSeenSession = sidNow; }
+                else if (sidNow && sidNow !== 'unknown' && sidNow !== lastSeenSession) {
+                    lastSeenSession = sidNow;
+                    flushHeld(sidNow);
+                }
+            } catch (_) {}
+            try {
+                if (rateLimitBackoffUntil > 0) {
                 if (Date.now() < rateLimitBackoffUntil) return; // still cooling
                 // Expired: retry once, then clear and resume.
                 rateLimitBackoffUntil = 0;
                 if (!backoffRetried && lastFeedbackForRetry.text &&
                     Date.now() - lastFeedbackForRetry.at < 10 * 60 * 1000) {
                     backoffRetried = true;
+                    // v4.4: 冷却重发同样验会话亲和。
+                    let rsid = null, cur2 = null;
+                    try { rsid = lastFeedbackForRetry.sid || null; cur2 = currentSessionId(); } catch (_) {}
+                    if (rsid && cur2 && cur2 !== 'unknown' && rsid !== cur2) {
+                        holdFeedback(rsid, lastFeedbackForRetry.text);
+                        updateHUD('冷却重发的反馈暂存（属会话 ' + shortSid(rsid) + '），切回去自动发送', '#f59e0b');
+                    } else {
                     updateHUD('冷却结束，重发上一条反馈…', '#2563eb');
                     try { diagAttach({ phase: 'rate-limit-retry' }); } catch (_) {}
                     injectPrompt(lastFeedbackForRetry.text, true);
                     burstCollapse();
+                    }
                 }
                 return;
             }
