@@ -48,6 +48,9 @@ namespace DeepSeek
         private long _lastDropTimestamp = 0;
         private long _lastInjectTicks = 0;
 
+        // DSX built-in plugin host (native; no CDP / no debug port / no external process)
+        private PluginHost? _pluginHost;
+
         // Persistent runspace: kills per-command powershell.exe spawn (~200-500ms each).
         // Session persists across commands (cwd, variables, $env:), commands stay serialized via _execGate.
         private Runspace? _runspace;
@@ -366,6 +369,26 @@ namespace DeepSeek
                     App.Log($"agent_bridge.js script registered ({bridgeScript.Length} chars)");
                 }
 
+                // Inject DSX plugin runtime on document created (auto-restores after any navigation).
+                // Plugins themselves are loaded by PluginHost once the DOM is ready (poll loop).
+                string runtimeScript = GetPluginRuntimeScript();
+                if (!string.IsNullOrEmpty(runtimeScript))
+                {
+                    await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(runtimeScript);
+                    App.Log($"DSX plugin runtime registered ({runtimeScript.Length} chars)");
+                }
+
+                // Start the DSX built-in plugin host (watches Documents\DeepSeek-Agent\plugins).
+                try
+                {
+                    _pluginHost = new PluginHost(EvalInUi, PluginHost.ResolvePluginDir());
+                    _pluginHost.Start();
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[DSX] plugin host start failed: {ex.Message}");
+                }
+
                 // Navigate to DeepSeek
                 App.Log("Navigating to https://chat.deepseek.com ...");
                 webView.CoreWebView2.Navigate("https://chat.deepseek.com");
@@ -439,7 +462,49 @@ namespace DeepSeek
             return "";
         }
 
-        private void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+        /// <summary>Marshals CoreWebView2.ExecuteScriptAsync onto the UI thread (thread-affine).</summary>
+        private Task<string> EvalInUi(string js)
+        {
+            try
+            {
+                return Dispatcher.InvokeAsync(() => webView.CoreWebView2.ExecuteScriptAsync(js)).Task.Unwrap();
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[DSX] eval marshal failed: {ex.Message}");
+                return Task.FromResult("");
+            }
+        }
+
+        private string GetPluginRuntimeScript()
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // 1. Try runtime\plugin-loader.js next to executable (shipped with install)
+            string localPath = Path.Combine(baseDir, "runtime", "plugin-loader.js");
+            if (File.Exists(localPath))
+            {
+                try { return File.ReadAllText(localPath, Encoding.UTF8); } catch {}
+            }
+
+            // 2. Try repo runtime directory (development mode)
+            string repoPath = Path.Combine(baseDir, "..", "..", "..", "..", "windows", "runtime", "plugin-loader.js");
+            if (File.Exists(repoPath))
+            {
+                try { return File.ReadAllText(repoPath, Encoding.UTF8); } catch {}
+            }
+
+            // 3. Try the standalone DSX repo (legacy dev layout)
+            string dsxPath = @"C:\Users\Admin\Documents\Projects\deepseek-agent-plugins\runtime\plugin-loader.js";
+            if (File.Exists(dsxPath))
+            {
+                try { return File.ReadAllText(dsxPath, Encoding.UTF8); } catch {}
+            }
+
+            return "";
+        }
+
+        private async void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
             try
             {
@@ -475,6 +540,17 @@ namespace DeepSeek
                     string lastAction = root.TryGetProperty("lastAction", out var la) ? (la.GetString() ?? "") : "";
                     string ours = root.TryGetProperty("ours", out var o) ? o.GetString() ?? "" : "";
                     App.Log($"[CRASHWATCH] whale page visible url={url} lastAction={lastAction} ours={ours}");
+                }
+                else if (action == "plugins")
+                {
+                    // DSX plugin host diagnostics (list loaded plugins / runtime errors)
+                    if (_pluginHost == null)
+                    {
+                        App.Log("[DSX] plugin host not started");
+                        return;
+                    }
+                    var st = await _pluginHost.StatusAsync();
+                    App.Log($"[DSX] status={(st.HasValue ? st.Value.GetRawText() : "unavailable")}");
                 }
                 else if (action == "apisniff")
                 {
@@ -1354,6 +1430,7 @@ namespace DeepSeek
             "rs:document.readyState," +
             "hudBtn:!!document.getElementById('agent-inject-btn')," +
             "scan:((window.__agentBridge && window.__agentBridge._debug && window.__agentBridge._debug.describeScan) ? window.__agentBridge._debug.describeScan() : null)," +
+            "dsx:(window.__DSX ? {ready:window.__DSX.__ready,plugins:window.__DSX.list(),errors:window.__DSX.errors()} : null)," +
             "textareas:[...document.querySelectorAll('textarea')].map(t=>({id:t.id,cls:String(t.className).slice(0,50),ph:t.placeholder,dis:t.disabled}))," +
             "ces:[...document.querySelectorAll('[contenteditable]')].map(x=>({tag:x.tagName,cls:String(x.className).slice(0,50)}))" +
             "})";

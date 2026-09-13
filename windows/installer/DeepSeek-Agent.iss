@@ -51,6 +51,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; App payload (multi-file publish; single-file is forbidden by PowerShell SDK, see csproj)
 Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; DSX plugin runtime (built-in hot-load plugin system)
+Source: "..\runtime\plugin-loader.js"; DestDir: "{app}\runtime"; Flags: ignoreversion
 ; Bundled offline prereqs (extracted to temp only when needed)
 Source: "{#PrereqDir}\windowsdesktop-runtime.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall nocompression
 Source: "{#PrereqDir}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall nocompression
