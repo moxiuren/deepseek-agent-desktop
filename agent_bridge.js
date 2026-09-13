@@ -1123,6 +1123,10 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
             try { controller.setOutput(rmRefusal, true); } catch (_) {}
             try { updateHUD('危险通配符已拦截', '#ef4444'); } catch (_) {}
             isExecutingNow = false;
+            // v4.3.6 refusal-feedback fix (P6): a refusal with no result wedges the model
+            // (it waits for a [Tool Call Result] that never comes). Route through the
+            // normal result pipeline so the refusal REACHES the conversation.
+            try { window.__agentBridge.onCommandResult({ id: controller.cardId, exitCode: 1, output: rmRefusal, __verified: true }); } catch (_) {}
             return;
         }
         try { pendingDispatch.set(controller.cardId, { sig: 'cmd:' + normCmd, at: Date.now() }); } catch (_) {}
@@ -1138,6 +1142,9 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
             try { controller.setOutput(sjMsg, true); } catch (_) {}
             try { updateHUD('Start-Job 已拦截，已给异步模板', '#ef4444'); } catch (_) {}
             isExecutingNow = false;
+            // v4.3.6 refusal-feedback fix (P6): same as wildcard refusal — no result =
+            // model waits forever. Deliver the intercept as a normal (failed) result.
+            try { window.__agentBridge.onCommandResult({ id: controller.cardId, exitCode: 1, output: sjMsg, __verified: true }); } catch (_) {}
             return;
         }
 
