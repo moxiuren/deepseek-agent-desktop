@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.1 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -304,9 +304,11 @@
             if (!t) return false;
             if (t === 'Copy' || t === 'Download' || t === '复制' || t === '下载') return false;
             if (t.includes('local_cmdCopyDownload')) return false;
-            if (t === 'local_cmd' || t === 'bash' || t === 'sh') return false;
-            // v4.3: 围栏分隔行（含 "- ```local_cmd" 列表符形态）永不进入命令（2026-09-13 f55efba5 parent 296 实锤）。
+            if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
+            if (/local_cmd/i.test(t) && /(?:Copy|Download|复制|下载)/i.test(t)) return false;
+            // v4.3/v4.3.1: 围栏分隔行（含 "- ```local_cmd" 列表符形态及尾部围栏）永不进入命令
             if (/^\s*(-\s*)?```/.test(line)) return false;
+            if (/^\s*```\s*$/.test(line)) return false;
             return true;
         });
 
@@ -665,7 +667,7 @@
         // Falls back to unscoped when the site DOM matches nothing.
         let scanScope = null;
         try {
-            const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]');
+            const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown');
             for (let i = containers.length - 1; i >= 0; i--) {
                 const c = containers[i];
                 let t = '';
@@ -673,7 +675,8 @@
                 if (t.includes('[Tool Call')) continue;
                 let hasCode = false, ownUi = false;
                 try {
-                    hasCode = !!c.querySelector('pre, code');
+                    hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
+                              /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
                     ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
                 } catch (_) {}
                 if (ownUi || !hasCode) continue;
@@ -681,6 +684,8 @@
                 break;
             }
         } catch (_) {}
+
+        let foundAny = false;
 
         for (let el of blocks) {
             if (processedBlocks.has(el)) continue;
@@ -707,22 +712,43 @@
             const isFileWrite = !!fileInfo;
 
             const fullText = (parent.innerText || parent.textContent || '').trim();
-            // v4.3: 围栏锚定（2026-09-13 f55efba5：纯讨论文字含 local_cmd 关键词曾被当命令执行 `text`×2）。
-            // local_cmd 路径必须有围栏结构（围栏信息串 / language-* 类）；agy/opencode 裸命令触发器保持原样。
+            const banner = parent.querySelector('[class*="banner"], [class*="infostring"], [class*="header"], [class*="lang"]');
+            const bannerText = (banner ? (banner.innerText || banner.textContent || '') : '').trim();
             const elCls = (el.className || '');
+            const parentCls = (parent.className || '');
             let codeLang = '';
-            try { const ce = parent.querySelector('code'); codeLang = ce ? (ce.className || '') : ''; } catch (_) {}
-            const hasCmdFence = /```\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText) ||
-                                (elCls.includes('local_cmd') && !elCls.includes('local_cmdCopyDownload')) ||
-                                /language-(local_cmd|bash|sh|powershell|pwsh)/i.test(elCls + ' ' + codeLang);
-            const mentionsLocalCmd = fullText.includes('local_cmd') || elCls.includes('local_cmd');
-            const isLocalCmd = !isFileWrite && (
+            try { const ce = parent.querySelector('.md-code-block-content code, pre code, code'); codeLang = ce ? (ce.className || '') : ''; } catch (_) {}
+
+            const lines = fullText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            const firstLine = lines[0] || '';
+
+            // v4.3.1: 围栏与语言标记双通道检测
+            // 1. 语言标签匹配（banner / infostring / class）
+            const isCmdLang = /^(local_cmd|bash|sh|powershell|pwsh)\b/i.test(bannerText) ||
+                              /^local_cmd/i.test(bannerText) ||
+                              /language-(local_cmd|bash|sh|powershell|pwsh)\b/i.test(codeLang + ' ' + parentCls + ' ' + elCls);
+
+            // 2. 文本第一行或内容中带围栏标记
+            const hasFencePattern = /^(?:-\s*)?(?:```)?\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(firstLine) ||
+                                    /^local_cmd(?:Copy|Download|复制|下载)/i.test(firstLine) ||
+                                    /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText);
+
+            // 3. 显式其他语言防护（如 ```text, ```json 等，防讨论 local_cmd 关键字时被误判）
+            const isOtherExplicitLang = bannerText && !/^(local_cmd|bash|sh|powershell|pwsh)\b/i.test(bannerText) &&
+                /^(text|txt|json|markdown|md|python|py|javascript|js|typescript|ts|html|css|yaml|yml|sql|c|cpp|csharp|cs|go|rust|rs)\b/i.test(bannerText);
+
+            const hasCmdFence = isCmdLang || hasFencePattern;
+            const mentionsLocalCmd = fullText.includes('local_cmd') || elCls.includes('local_cmd') || parentCls.includes('local_cmd') || bannerText.includes('local_cmd');
+
+            const isLocalCmd = !isFileWrite && !isOtherExplicitLang && (
                                 (mentionsLocalCmd && hasCmdFence) ||
+                                isCmdLang ||
                                 fullText.includes('agy-run') ||
                                 fullText.includes('agy --model') ||
                                 fullText.includes('opencode run'));
 
             if (!isLocalCmd && !isFileWrite) continue;
+            foundAny = true;
 
             let cleanCmd = "";
             let fileContent = "";
@@ -799,6 +825,89 @@
                 if (autoExecute && !isExecutingNow) {
                     executeCommand(cleanCmd, controller);
                     break;
+                }
+            }
+        }
+
+        // v4.3.1: scanScope 文本兜底（当渲染器不产 pre/code-block 节点，或处于未解析原始围栏时）
+        if (!foundAny && scanScope && !processedBlocks.has(scanScope)) {
+            let isOwn = false;
+            try {
+                isOwn = !!scanScope.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
+            } catch (_) {}
+            const scopeText = (scanScope.innerText || scanScope.textContent || '');
+            if (!isOwn && !scopeText.includes('[Tool Call')) {
+                const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
+                const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
+
+                const writeMatch = scopeText.match(writeFenceRe);
+                const cmdMatch = !writeMatch ? scopeText.match(cmdFenceRe) : null;
+
+                if (writeMatch) {
+                    const rawPath = writeMatch[1];
+                    const targetPath = cleanPathCandidate(rawPath);
+                    const fileContent = writeMatch[2] || '';
+                    if (targetPath && fileContent.trim()) {
+                        const trackKey = targetPath + "::" + fileContent;
+                        let tracker = blockWatchMap.get(scanScope);
+                        if (!tracker) {
+                            tracker = { text: trackKey, lastChange: now };
+                            blockWatchMap.set(scanScope, tracker);
+                        } else if (tracker.text !== trackKey) {
+                            tracker.text = trackKey;
+                            tracker.lastChange = now;
+                        } else if (now - tracker.lastChange >= 1800) {
+                            processedBlocks.add(scanScope);
+                            blockWatchMap.delete(scanScope);
+                            console.log(`[Agent Bridge] [Scope Fallback] Complete File Write Detected: ${targetPath} (${fileContent.length} chars)`);
+                            const controller = renderToolCallCard(scanScope, fileContent, (content, ctrl) => {
+                                executeFileWrite(targetPath, content, ctrl);
+                            }, 'write_file', { path: targetPath, content: fileContent });
+
+                            if (autoExecute && !isExecutingNow) {
+                                executeFileWrite(targetPath, fileContent, controller);
+                            }
+                        }
+                    }
+                } else if (cmdMatch) {
+                    const rawBody = cmdMatch[2] || '';
+                    const cleanCmd = rawBody.split(/\r?\n/).filter(line => {
+                        const t = line.trim();
+                        if (!t) return false;
+                        if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
+                        if (/^\s*(-\s*)?```/.test(line)) return false;
+                        return true;
+                    }).join('\n').trim();
+
+                    if (cleanCmd && cleanCmd.length >= 2) {
+                        const trackKey = cleanCmd;
+                        let tracker = blockWatchMap.get(scanScope);
+                        if (!tracker) {
+                            tracker = { text: trackKey, lastChange: now };
+                            blockWatchMap.set(scanScope, tracker);
+                        } else if (tracker.text !== trackKey) {
+                            tracker.text = trackKey;
+                            tracker.lastChange = now;
+                        } else if (now - tracker.lastChange >= 1800) {
+                            if (isQuoteBalanced(cleanCmd) && isBracketBalanced(cleanCmd)) {
+                                const isHtml = /<[a-zA-Z][^>]*>/.test(cleanCmd) && /<\/(div|span|style|html|body)>|vcp-root/i.test(cleanCmd);
+                                if (!isHtml) {
+                                    processedBlocks.add(scanScope);
+                                    blockWatchMap.delete(scanScope);
+                                    console.log("[Agent Bridge] [Scope Fallback] Complete Tool Call Detected:\n", cleanCmd);
+                                    const controller = renderToolCallCard(scanScope, cleanCmd, (cmd, ctrl) => {
+                                        executeCommand(cmd, ctrl);
+                                    }, 'cmd');
+
+                                    if (autoExecute && !isExecutingNow) {
+                                        executeCommand(cleanCmd, controller);
+                                    }
+                                }
+                            } else {
+                                console.log("[Agent Bridge] [Scope Fallback] Waiting for balanced quotes/brackets:\n", cleanCmd);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1171,7 +1280,7 @@
                 // Ground truth for "why isn't this block dispatching".
                 try {
                     const blocks = Array.from(document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block'));
-                    const containers = Array.from(document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id]'));
+                    const containers = Array.from(document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown'));
                     let scopeIdx = -1;
                     for (let i = containers.length - 1; i >= 0; i--) {
                         const c = containers[i];
@@ -1180,7 +1289,8 @@
                         if (t.includes('[Tool Call')) continue;
                         let hasCode = false, ownUi = false;
                         try {
-                            hasCode = !!c.querySelector('pre, code');
+                            hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
+                                      /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
                             ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
                         } catch (_) {}
                         if (ownUi || !hasCode) continue;
