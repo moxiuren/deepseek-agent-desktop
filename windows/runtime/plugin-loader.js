@@ -1,14 +1,14 @@
 /* DSX - DeepSeek Agent eXtensions runtime
- * 注入位置: WebView2 页面上下文 (通过 CDP Runtime.evaluate)
+ * 注入位置: WebView2 页面上下文 (通过 CDP Runtime.evaluate / 内置宿主 document-created)
  * 职责: 插件注册表 / 生命周期 / 热重载替换 / 每插件隔离的 ctx
- * 版本: 1.0.0
+ * 版本: 1.0.1 (observe 修复: documentElement 未就绪时延迟到 DOMContentLoaded)
  */
 (function () {
   if (window.__DSX && window.__DSX.__ready) {
     console.log('[DSX] runtime 已存在, 跳过重复安装');
     return;
   }
-  var VERSION = '1.0.0';
+  var VERSION = '1.0.1';
   var registry = new Map();
   var errorLog = [];
   function makeCtx(meta) {
@@ -31,10 +31,20 @@
         el.addEventListener(ev, fn, opt);
         return function () { el.removeEventListener(ev, fn, opt); };
       },
-      observe: function (fn, opt) {
+observe: function (fn, opt) {
         var mo = new MutationObserver(fn);
         var cfg = Object.assign({ childList: true, subtree: true }, opt || {});
-        mo.observe(document.documentElement, cfg);
+        // documentElement 可能尚未就绪 (document-created 注入早于 DOM 构造)
+        // 未就绪时延迟到 DOMContentLoaded, 避免 mo.observe 抛 TypeError
+        var root = document.documentElement || document.body;
+        if (root) {
+          mo.observe(root, cfg);
+        } else {
+          document.addEventListener('DOMContentLoaded', function () {
+            var r2 = document.documentElement || document.body;
+            if (r2) mo.observe(r2, cfg);
+          });
+        }
         return function () { mo.disconnect(); };
       },
       _timers: [],
