@@ -1,4 +1,4 @@
-﻿/* 示例插件: hello-panel
+/* 示例插件: hello-panel
  * 在页面右下角显示一个悬浮面板, 证明插件系统可用
  * 演示: ctx.el / ctx.on / ctx.every / ctx.store / onUnload 清理
  */
@@ -44,8 +44,6 @@ module.exports = {
     if (typeof this._cleanup === 'function') this._cleanup();
   }
 };
-
-
 
 
 
