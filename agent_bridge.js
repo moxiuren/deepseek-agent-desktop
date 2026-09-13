@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.2 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -63,7 +63,7 @@
 \`\`\`
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
-【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律三条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连。
+【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律四条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连；④Exit:1 且报错含 not recognized / Unexpected token / Missing expression → 说明命令被提取错了，换写法重发，严禁原样重发。
 【搜索纪律】：禁裸扫全盘——用户目录根/盘符根/注册表递归必须带 -Depth（≤3），先 Desktop/Documents/Projects，禁 AppData；护栏会直接打回无 -Depth 的裸扫；确需全量加注释 #scan-ok。
 请确认收到，并等待用户指令。`;
 
@@ -305,6 +305,8 @@
             if (t === 'Copy' || t === 'Download' || t === '复制' || t === '下载') return false;
             if (t.includes('local_cmdCopyDownload')) return false;
             if (t === 'local_cmd' || t === 'bash' || t === 'sh') return false;
+            // v4.3: 围栏分隔行（含 "- ```local_cmd" 列表符形态）永不进入命令（2026-09-13 f55efba5 parent 296 实锤）。
+            if (/^\s*(-\s*)?```/.test(line)) return false;
             return true;
         });
 
@@ -705,12 +707,20 @@
             const isFileWrite = !!fileInfo;
 
             const fullText = (parent.innerText || parent.textContent || '').trim();
+            // v4.3: 围栏锚定（2026-09-13 f55efba5：纯讨论文字含 local_cmd 关键词曾被当命令执行 `text`×2）。
+            // local_cmd 路径必须有围栏结构（围栏信息串 / language-* 类）；agy/opencode 裸命令触发器保持原样。
+            const elCls = (el.className || '');
+            let codeLang = '';
+            try { const ce = parent.querySelector('code'); codeLang = ce ? (ce.className || '') : ''; } catch (_) {}
+            const hasCmdFence = /```\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText) ||
+                                (elCls.includes('local_cmd') && !elCls.includes('local_cmdCopyDownload')) ||
+                                /language-(local_cmd|bash|sh|powershell|pwsh)/i.test(elCls + ' ' + codeLang);
+            const mentionsLocalCmd = fullText.includes('local_cmd') || elCls.includes('local_cmd');
             const isLocalCmd = !isFileWrite && (
-                               fullText.includes('local_cmd') ||
-                               el.className.includes('local_cmd') ||
-                               fullText.includes('agy-run') ||
-                               fullText.includes('agy --model') ||
-                               fullText.includes('opencode run'));
+                                (mentionsLocalCmd && hasCmdFence) ||
+                                fullText.includes('agy-run') ||
+                                fullText.includes('agy --model') ||
+                                fullText.includes('opencode run'));
 
             if (!isLocalCmd && !isFileWrite) continue;
 
