@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.1 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.2 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -69,6 +69,7 @@
 
     let autoExecute = true;
     let isExecutingNow = false;
+    let executingStartedAt = 0;
     // Last dispatch signature for duplicate merging.
     let lastDispatch = { cmd: '', at: 0 };
     // Serializes feedback sends: each feedback fills+clicks only after the
@@ -117,6 +118,7 @@
     let __attachInjectedAt = 0;
     let cardControllers = {};
     let blockWatchMap = new Map();
+    let cmdWatchMap = new Map();
     let pendingFeedbackTimer = null;
     // Direct-loop virtual queue: replies arriving out-of-band are scanned here
     // and dispatched one at a time (the page stays a passive viewport).
@@ -137,15 +139,21 @@
         // NOTE: PowerShell's escape char is the BACKTICK, not backslash.
         // Treating \ as escape breaks every Windows path ending in \'
         // (the string then looks forever-unbalanced and the call never fires).
+        // Also skip # line comments when outside quotes so apostrophes in comments (e.g. # Don't) don't wedge the parser.
         let inDouble = false;
         let inSingle = false;
         let escaped = false;
-        for (let i = 0; i < cmd.length; i++) {
-            let ch = cmd[i];
-            if (escaped) { escaped = false; continue; }
-            if (ch === '`') { escaped = true; continue; }
-            if (ch === '"' && !inSingle) inDouble = !inDouble;
-            else if (ch === "'" && !inDouble) inSingle = !inSingle;
+        const lines = String(cmd || '').split(/\r?\n/);
+        for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            for (let i = 0; i < line.length; i++) {
+                let ch = line[i];
+                if (escaped) { escaped = false; continue; }
+                if (ch === '`') { escaped = true; continue; }
+                if (!inSingle && !inDouble && ch === '#') break;
+                if (ch === '"' && !inSingle) inDouble = !inDouble;
+                else if (ch === "'" && !inDouble) inSingle = !inSingle;
+            }
         }
         return !inDouble && !inSingle;
     }
@@ -652,6 +660,45 @@
         return controller;
     }
 
+    // Helper: Safely resolve the latest assistant message container scope.
+    // Explicitly distinguishes assistant vs user-feedback containers so that model thoughts
+    // or assistant preamble quoting "[Tool Call" never poison or reject valid execution scopes.
+    function resolveScanScope() {
+        try {
+            const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown');
+            for (let i = containers.length - 1; i >= 0; i--) {
+                const c = containers[i];
+                let t = '';
+                try { t = c.textContent || ''; } catch (_) {}
+                const isAssistant = (c.classList && c.classList.contains('ds-assistant-message-main-content')) ||
+                                    !!c.querySelector('.ds-assistant-message-main-content');
+                // Only skip explicit user feedback bubbles; NEVER skip assistant messages
+                const isUserFeedback = !isAssistant && (
+                    t.trim().startsWith('[Tool Call') ||
+                    t.trim().startsWith('【本地工具执行结果') ||
+                    (c.className && c.className.includes('d29f3d7d')) ||
+                    !!c.querySelector('.agent-collapsed-pill')
+                );
+                if (isUserFeedback) continue;
+                let hasCode = false, ownUi = false;
+                try {
+                    hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
+                              /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
+                    // Check if ALL code blocks inside this container are already processed
+                    const pBlocks = c.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
+                    let allProcessed = (pBlocks.length > 0);
+                    for (let pb of pBlocks) {
+                        if (!processedBlocks.has(pb)) { allProcessed = false; break; }
+                    }
+                    ownUi = allProcessed && !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card');
+                } catch (_) {}
+                if (ownUi || !hasCode) continue;
+                return { scope: c, index: i };
+            }
+        } catch (_) {}
+        return { scope: null, index: -1 };
+    }
+
     // 3. Scanner with Debounce & Quote Verification
     function scanAndProcessToolCalls() {
         if (isExecutingNow) return;
@@ -660,37 +707,15 @@
         const now = Date.now();
 
         // Scope whitelist: only blocks inside the LATEST message-like container
-        // may start a call. Walk from the end and take the first container that
-        // holds code but is neither our feedback (marker) nor our own UI nor the
-        // composer (no code). Bare "last container" misfires when the composer
-        // or our own bubbles sort after the model message.
-        // Falls back to unscoped when the site DOM matches nothing.
-        let scanScope = null;
-        try {
-            const containers = document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown');
-            for (let i = containers.length - 1; i >= 0; i--) {
-                const c = containers[i];
-                let t = '';
-                try { t = c.textContent || ''; } catch (_) {}
-                if (t.includes('[Tool Call')) continue;
-                let hasCode = false, ownUi = false;
-                try {
-                    hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
-                              /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
-                    ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
-                } catch (_) {}
-                if (ownUi || !hasCode) continue;
-                scanScope = c;
-                break;
-            }
-        } catch (_) {}
+        // may start a call. Falls back to unscoped when the site DOM matches nothing.
+        const { scope: scanScope } = resolveScanScope();
 
         let foundAny = false;
 
         for (let el of blocks) {
             if (processedBlocks.has(el)) continue;
 
-            const parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el;
+            const parent = el.closest('.md-code-block, [class*="code-block"]:not([class*="banner"]):not([class*="header"]), [class*="codeBlock"]') || el;
             if (processedBlocks.has(parent)) continue;
 
             // Never scan our own UI (HUD / tool cards / collapsed pills).
@@ -763,11 +788,16 @@
                 trackKey = cleanCmd;
             }
 
-            // Debounce
+            // Debounce (dual-keyed: DOM node identity + content signature to survive React re-renders)
             let tracker = blockWatchMap.get(parent);
+            if (!tracker && cmdWatchMap.has(trackKey)) {
+                tracker = cmdWatchMap.get(trackKey);
+                blockWatchMap.set(parent, tracker);
+            }
             if (!tracker) {
                 tracker = { text: trackKey, lastChange: now };
                 blockWatchMap.set(parent, tracker);
+                cmdWatchMap.set(trackKey, tracker);
                 continue;
             }
 
@@ -777,7 +807,11 @@
                 continue;
             }
 
-            if (now - tracker.lastChange < 1800) {
+            // If SSE stream completion was recorded within the last 15s, content is stable -> allow 800ms debounce
+            const streamDone = (window.__lastCompletionAt && (now - window.__lastCompletionAt >= 500) && (now - window.__lastCompletionAt < 15000));
+            const debounceThreshold = streamDone ? 800 : 1800;
+
+            if (now - tracker.lastChange < debounceThreshold) {
                 continue;
             }
 
@@ -803,6 +837,7 @@
             processedBlocks.add(el);
             processedBlocks.add(parent);
             blockWatchMap.delete(parent);
+            cmdWatchMap.delete(trackKey);
 
             if (isFileWrite) {
                 console.log(`[Agent Bridge] Complete File Write Detected. Target: ${fileInfo.path} (${fileContent.length} chars)`);
@@ -933,6 +968,7 @@
         lastDispatch = { cmd: normCmd, at: nowMs };
 
         isExecutingNow = true;
+        executingStartedAt = Date.now();
         controller.hidePacing();
         controller.setStatus("正在执行本地命令...", "#d97706", true);
         controller.setOutput("[本地终端进程已启动，正在执行指令...]");
@@ -970,6 +1006,7 @@
         lastDispatch = { cmd: sig, at: nowMs };
 
         isExecutingNow = true;
+        executingStartedAt = Date.now();
         controller.hidePacing();
         controller.setStatus("正在写入本地文件...", "#0d9488", true);
         controller.setOutput(`[正在将文件落盘至本地系统...]\n目标路径: ${path}\n文件大小: ${content.length} 字符`);
@@ -995,8 +1032,8 @@
         let node;
         const textNodes = [];
         while (node = walker.nextNode()) {
-            const v = node.nodeValue || '';
-            if (v.includes('[Tool Call') || v.includes('【本地工具执行结果')) {
+            const v = (node.nodeValue || '').trim();
+            if (v.startsWith('[Tool Call') || v.startsWith('【本地工具执行结果')) {
                 textNodes.push(node);
             }
         }
@@ -1006,6 +1043,12 @@
             // Climb up to the user message wrapper or bubble
             while (container && container !== document.body) {
                 if (collapsedBubblesSet.has(container)) break;
+
+                // Never collapse assistant message containers
+                if ((container.classList && container.classList.contains('ds-assistant-message-main-content')) ||
+                    (container.querySelector && container.querySelector('.ds-assistant-message-main-content'))) {
+                    break;
+                }
 
                 // Check if this container is a user message container
                 const isMsg = container.classList && (
@@ -1281,25 +1324,10 @@
                 try {
                     const blocks = Array.from(document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block'));
                     const containers = Array.from(document.querySelectorAll('[class*="chat-item"], [class*="message-item"], [class*="message"], [role="article"], [data-message-id], .ds-markdown'));
-                    let scopeIdx = -1;
-                    for (let i = containers.length - 1; i >= 0; i--) {
-                        const c = containers[i];
-                        let t = '';
-                        try { t = c.textContent || ''; } catch (_) {}
-                        if (t.includes('[Tool Call')) continue;
-                        let hasCode = false, ownUi = false;
-                        try {
-                            hasCode = !!c.querySelector('pre, code, [class*="code-block"], [class*="codeBlock"], .md-code-block') ||
-                                      /(?:^|\n)\s*(?:-\s*)?```\s*(?:local_cmd|bash|sh|powershell|pwsh|write_file)/i.test(t);
-                            ownUi = !!c.querySelector('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill');
-                        } catch (_) {}
-                        if (ownUi || !hasCode) continue;
-                        scopeIdx = i;
-                        break;
-                    }
+                    const { scope: scanScope, index: scopeIdx } = resolveScanScope();
                     const tail = blocks.slice(-4).map((el, k) => {
                         let parent = null;
-                        try { parent = el.closest('[class*="code-block"], [class*="codeBlock"]') || el; } catch (_) { parent = el; }
+                        try { parent = el.closest('.md-code-block, [class*="code-block"]:not([class*="banner"]):not([class*="header"]), [class*="codeBlock"]') || el; } catch (_) { parent = el; }
                         const ft = ((parent.innerText || parent.textContent) || '');
                         return {
                             n: blocks.length - 4 + k,
@@ -1392,6 +1420,7 @@
         },
         onDirectSendSuccess: function(cardId) {
             isExecutingNow = false;
+            executingStartedAt = 0;
             try {
                 const c = cardControllers[cardId];
                 if (c) {
@@ -1426,6 +1455,7 @@
         },
         onCommandResult: function(data) {
             isExecutingNow = false;
+            executingStartedAt = 0;
             const cardId = data.id;
             const exitCode = data.exitCode;
             try {
@@ -2062,7 +2092,12 @@ ${output}
 
     setInterval(() => {
         try {
-            if (document.hidden) return; // background tab: don't burn CPU scanning
+            // Watchdog: clear wedged execution lock if native execution exceeded 125s
+            if (isExecutingNow && executingStartedAt > 0 && Date.now() - executingStartedAt > 125000) {
+                console.warn('[Agent Bridge] isExecutingNow watchdog: cleared wedged execution lock (>125s)');
+                isExecutingNow = false;
+                executingStartedAt = 0;
+            }
             createFloatingHUD();
             scanAndProcessToolCalls();
             collapseToolFeedbackBubbles();
