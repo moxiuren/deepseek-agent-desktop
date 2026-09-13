@@ -1,13 +1,13 @@
-/* DSX - VCP HTML Card Render Plugin (v2.0.0)
+/* DSX - VCP HTML Card Render Plugin (v2.1.0)
  * 让 DeepSeek Agent 可以像本地 DSH 一样直接输出并渲染高质感 HTML 视觉卡片
  * 
- * 核心能力：
- * 1. 自动/一键向模型注入 VCP 视觉通感协议 (让模型主动输出 HTML 卡片)
- * 2. 双通道卡片渲染 (代码块 ```html 与 正文裸标签 <div id="vcp-root"> 双支持)
- * 3. Shadow DOM 隔离渲染 + 高质感排版底座 (样式互不污染)
- * 4. 交互式卡片桥接 (卡内 onclick="input('...')" 可直接触发对话)
- * 5. 卡片工具栏 (卡片/源码即时切换、一键复制、下载独立 HTML 单文件)
- * 6. 控制面板 (悬浮 </> 按钮 + HUD 联动 + 4 套高频卡片模板)
+ * 核心升级与修复：
+ * 1. 深度配平闭合校验：严格检测 depth === 0，彻底解决流式输出中途未闭合导致「仅显示标题栏、内容空白」的缺陷；
+ * 2. 精准 DOM 锚定：锁定 .md-code-block 与 pre code 提取纯净源码，杜绝误抓顶部 banner 产生的空卡片；
+ * 3. Shadow DOM 隔离与防样式溢出：内建高质感现代排版底座与盒模型重置，卡片与客户端 UI 双向隔离；
+ * 4. 交互式桥接：打通 window.input / __dshInput，卡内按钮点击直达聊天输入；
+ * 5. 全套卡片工具栏：预览/源码无缝切换、复制代码、下载包含样式的单文件 HTML；
+ * 6. 控制面板：右下角悬浮按钮 + HUD 联动 + 4 套高频卡片模板与一键协议激活。
  */
 
 module.exports = {
@@ -16,7 +16,7 @@ module.exports = {
     var cleanups = [];
     var renderedCardsCount = 0;
 
-    // ---- 配置与存储 --------------------------------------------------------
+    // ---- 配置与持久化 ------------------------------------------------------
     var STORE_RENDER_KEY = 'vcp_render_enabled';
     var STORE_AUTO_PROMPT_KEY = 'vcp_auto_prompt';
     
@@ -27,6 +27,7 @@ module.exports = {
     function setRenderEnabled(val) {
       ctx.store.set(STORE_RENDER_KEY, val ? '1' : '0');
       updateUIState();
+      if (val) scanAndRender();
     }
     function isAutoPromptEnabled() {
       var val = ctx.store.get(STORE_AUTO_PROMPT_KEY, '0');
@@ -37,7 +38,7 @@ module.exports = {
       updateUIState();
     }
 
-    // ---- VCP 视觉通感协议系统提示词 ---------------------------------------
+    // ---- VCP 视觉通感协议提示词 -------------------------------------------
     var VCP_SYSTEM_PROMPT = 
       '【系统协议：VCP 视觉通感卡片已激活】\n' +
       '你获得了解锁「视觉通感」的能力——请主动运用 HTML5/CSS3/SVG 作为画笔，根据当前对话的情绪、主题与语境，动态构建最契合的视觉界面；在合适的时机主动用视觉承载内容。\n\n' +
@@ -50,7 +51,7 @@ module.exports = {
       '   - 交互支持：卡片内部按钮可设置 onclick="input(\'指令文本\')" 实现点击直接快速继续对话。\n' +
       '请确认收到，并在接下来的回复中主动使用视觉卡片！';
 
-    // ---- 寻找输入框与发送按钮 ---------------------------------------------
+    // ---- 输入框与发送辅助 -------------------------------------------------
     function findInputTextarea() {
       return document.querySelector('textarea#chat-input') ||
              document.querySelector('textarea') ||
@@ -137,7 +138,7 @@ module.exports = {
       } catch (e) {}
     });
 
-    // ---- HTML 下载辅助函数 ------------------------------------------------
+    // ---- HTML 下载 --------------------------------------------------------
     function downloadCardAsHtml(htmlContent, cardTitle) {
       var safeTitle = (cardTitle || 'VCP-Card').replace(/[\\/:*?"<>|]/g, '_').trim() || 'vcp-card';
       var filename = safeTitle + '-' + Date.now() + '.html';
@@ -180,7 +181,7 @@ module.exports = {
       }, 1000);
     }
 
-    // ---- HTML 文本分析与提取 ----------------------------------------------
+    // ---- HTML 解析与配平校验 ----------------------------------------------
     function decodeHtmlEntities(str) {
       return String(str || '')
         .replace(/&lt;/g, '<')
@@ -190,7 +191,7 @@ module.exports = {
         .replace(/&amp;/g, '&');
     }
 
-    function extractCardTitleFromHtml(html) {
+    function extractCardTitle(html) {
       var m = html.match(/<(?:h[1-3]|title)\b[^>]*>([\s\S]*?)<\/(?:h[1-3]|title)>/i);
       if (m && m[1]) {
         var clean = m[1].replace(/<[^>]+>/g, '').trim();
@@ -201,34 +202,87 @@ module.exports = {
       return 'VCP 视觉卡片';
     }
 
-    function isHtmlCardCode(codeText) {
-      if (!codeText || codeText.length < 20) return false;
-      var trimmed = codeText.trim();
-      if (/^<!doctype\s+html/i.test(trimmed) || /^<html/i.test(trimmed)) return true;
-      if (/<div\b[^>]*\bid\s*=\s*["']vcp-root["']/i.test(trimmed)) return true;
-      // 包含较多 HTML 标签与样式的块
-      if ((trimmed.startsWith('<div') || trimmed.startsWith('<svg') || trimmed.startsWith('<table')) &&
-          trimmed.includes('</div>') &&
-          (trimmed.includes('style=') || trimmed.includes('<style') || trimmed.includes('class='))) {
-        return true;
+    // 严格检查 HTML 块是否完整闭合
+    function extractCompleteHtmlCard(rawText) {
+      if (!rawText || rawText.length < 30) return null;
+      var text = rawText.trim();
+
+      // 1. 检查完整网页 <!DOCTYPE html> ... </html>
+      if (/^<!doctype\s+html/i.test(text) || /^<html/i.test(text)) {
+        if (/<\/html\s*>$/i.test(text) || text.includes('</html>')) {
+          return text;
+        }
+        return null; // 流式未闭合
       }
-      return false;
+
+      // 2. 检查独立 SVG <svg ...> ... </svg>
+      if (/^<svg\b/i.test(text)) {
+        if (/<\/svg\s*>$/i.test(text) || text.includes('</svg>')) {
+          return text;
+        }
+        return null;
+      }
+
+      // 3. 检查 <div ... id="vcp-root" ...> 深度配平
+      var vcpOpen = text.match(/<div\b[^>]*\bid\s*=\s*["']vcp-root["'][^>]*>/i);
+      if (vcpOpen) {
+        var startIdx = vcpOpen.index;
+        var openEnd = startIdx + vcpOpen[0].length;
+        var depth = 1;
+        var tagRe = /<\/?div\b[^>]*>/gi;
+        tagRe.lastIndex = openEnd;
+        var tm;
+        var endIdx = -1;
+        while ((tm = tagRe.exec(text)) !== null) {
+          if (tm[0].charAt(1) === '/') depth--;
+          else depth++;
+          if (depth === 0) {
+            endIdx = tagRe.lastIndex;
+            break;
+          }
+        }
+        if (depth === 0 && endIdx > startIdx) {
+          return text.slice(startIdx, endIdx);
+        }
+        return null; // 流式中途尚未输出闭合 </div>
+      }
+
+      // 4. 普通 HTML 卡片 (以 <div 开头且有闭合 </div>，并含 class 或 style)
+      if (text.startsWith('<div') && (text.includes('style=') || text.includes('<style') || text.includes('class='))) {
+        var depthGen = 0;
+        var genRe = /<\/?div\b[^>]*>/gi;
+        var gm;
+        var endGen = -1;
+        while ((gm = genRe.exec(text)) !== null) {
+          if (gm[0].charAt(1) === '/') depthGen--;
+          else depthGen++;
+          if (depthGen === 0) {
+            endGen = genRe.lastIndex;
+            break;
+          }
+        }
+        if (depthGen === 0 && endGen > 0) {
+          return text.slice(0, endGen);
+        }
+      }
+
+      return null;
     }
 
     // ---- 创建 VCP 卡片展示 DOM -------------------------------------------
-    function buildCardViewElement(rawHtml, originalNodeToToggle) {
+    function buildCardViewElement(completeHtml, originalBlockNode) {
       var cardContainer = document.createElement('div');
       cardContainer.className = 'dsx-vcp-card-wrapper';
       cardContainer.style.cssText = 
         'margin: 14px 0;' +
         'border-radius: 14px;' +
-        'border: 1px solid rgba(59, 130, 246, 0.35);' +
+        'border: 1px solid rgba(59, 130, 246, 0.4);' +
         'background: #0b0f19;' +
-        'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);' +
+        'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);' +
         'overflow: hidden;' +
         'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;';
 
-      var cardTitle = extractCardTitleFromHtml(rawHtml);
+      var cardTitle = extractCardTitle(completeHtml);
 
       // 顶部操作栏
       var topBar = document.createElement('div');
@@ -247,7 +301,7 @@ module.exports = {
       var rightActions = document.createElement('div');
       rightActions.style.cssText = 'display: flex; align-items: center; gap: 6px;';
 
-      // 切换源码/卡片按钮
+      // 切换源码/卡片视图
       var isCodeView = false;
       var toggleBtn = document.createElement('button');
       toggleBtn.type = 'button';
@@ -256,7 +310,7 @@ module.exports = {
         'color: #bfdbfe; border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer; transition: all 0.15s;';
       toggleBtn.textContent = '查看源码';
 
-      // 复制代码按钮
+      // 复制代码
       var copyBtn = document.createElement('button');
       copyBtn.type = 'button';
       copyBtn.style.cssText = 
@@ -266,7 +320,7 @@ module.exports = {
       copyBtn.onclick = function (e) {
         e.stopPropagation();
         try {
-          navigator.clipboard.writeText(rawHtml);
+          navigator.clipboard.writeText(completeHtml);
           copyBtn.textContent = '已复制!';
           copyBtn.style.color = '#34d399';
           setTimeout(function () {
@@ -276,7 +330,7 @@ module.exports = {
         } catch (err) {}
       };
 
-      // 下载单文件 HTML 按钮
+      // 下载单文件 HTML
       var dlBtn = document.createElement('button');
       dlBtn.type = 'button';
       dlBtn.style.cssText = 
@@ -285,7 +339,7 @@ module.exports = {
       dlBtn.textContent = '⤓ 下载 HTML';
       dlBtn.onclick = function (e) {
         e.stopPropagation();
-        downloadCardAsHtml(rawHtml, cardTitle);
+        downloadCardAsHtml(completeHtml, cardTitle);
       };
 
       rightActions.appendChild(toggleBtn);
@@ -294,7 +348,7 @@ module.exports = {
       topBar.appendChild(leftInfo);
       topBar.appendChild(rightActions);
 
-      // 卡片主体容器（Shadow DOM 隔离渲染）
+      // 卡片主体容器（Shadow DOM 隔离）
       var previewHost = document.createElement('div');
       previewHost.className = 'dsx-vcp-preview-host';
       previewHost.style.cssText = 'padding: 16px; background: transparent; overflow-x: auto;';
@@ -310,7 +364,7 @@ module.exports = {
         '#vcp-root { width: 100%; margin: 0 auto; }\n';
 
       var cardBody = document.createElement('div');
-      cardBody.innerHTML = rawHtml;
+      cardBody.innerHTML = completeHtml;
 
       // 捕获 Shadow DOM 内部所有的交互按钮点击 (onclick="input(...)")
       cardBody.addEventListener('click', function (e) {
@@ -334,10 +388,11 @@ module.exports = {
       shadow.appendChild(resetStyle);
       shadow.appendChild(cardBody);
 
-      // 源码容器 (可折叠)
+      // 源码查看区域 (折叠)
       var codeView = document.createElement('div');
+      codeView.className = 'dsx-vcp-code-view';
       codeView.style.cssText = 'display: none; padding: 12px 16px; background: #030712; color: #7dd3fc; font-family: Consolas, monospace; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; max-height: 380px; overflow-y: auto;';
-      codeView.textContent = rawHtml;
+      codeView.textContent = completeHtml;
 
       toggleBtn.onclick = function (e) {
         e.stopPropagation();
@@ -362,71 +417,77 @@ module.exports = {
       return cardContainer;
     }
 
-    // ---- 渲染扫描与识别引擎 -----------------------------------------------
+    // ---- 渲染扫描与精确匹配引擎 -------------------------------------------
     function scanAndRender() {
       if (isDisposed || !isRenderEnabled()) return;
 
-      // 1. 扫描代码块 (Markdown Code Blocks)
-      var codeBlocks = document.querySelectorAll('pre, [class*="code-block"], [class*="codeBlock"], .md-code-block');
+      // 1. 扫描精准的 .md-code-block 容器
+      var codeBlocks = document.querySelectorAll('.md-code-block');
       for (var i = 0; i < codeBlocks.length; i++) {
-        var el = codeBlocks[i];
-        if (el.dataset.dsxVcpProcessed === '1') continue;
-        if (el.closest('.dsx-vcp-card-wrapper')) continue;
+        var block = codeBlocks[i];
+        if (block.dataset.dsxVcpProcessed === '1') continue;
 
-        var codeNode = el.querySelector('code') || el;
-        var text = (codeNode.innerText || codeNode.textContent || '').trim();
-        if (isHtmlCardCode(text)) {
-          el.dataset.dsxVcpProcessed = '1';
-          var card = buildCardViewElement(text, el);
-          el.style.display = 'none';
-          if (el.parentNode) {
-            el.parentNode.insertBefore(card, el.nextSibling);
+        var pre = block.querySelector('pre');
+        if (!pre) continue;
+
+        var codeText = (pre.textContent || '').trim();
+        var completeCard = extractCompleteHtmlCard(codeText);
+        if (completeCard) {
+          block.dataset.dsxVcpProcessed = '1';
+          var card = buildCardViewElement(completeCard, block);
+          block.style.display = 'none';
+          if (block.parentNode) {
+            block.parentNode.insertBefore(card, block.nextSibling);
             renderedCardsCount++;
           }
         }
       }
 
-      // 2. 扫描正文普通段落中的裸标签 <div id="vcp-root">
+      // 2. 扫描孤立的 pre 块 (如果未包裹在 .md-code-block 内)
+      var lonePres = document.querySelectorAll('pre');
+      for (var j = 0; j < lonePres.length; j++) {
+        var lp = lonePres[j];
+        if (lp.closest('.md-code-block') || lp.closest('.dsx-vcp-card-wrapper')) continue;
+        if (lp.dataset.dsxVcpProcessed === '1') continue;
+
+        var lpText = (lp.textContent || '').trim();
+        var lpCard = extractCompleteHtmlCard(lpText);
+        if (lpCard) {
+          lp.dataset.dsxVcpProcessed = '1';
+          var lpCardEl = buildCardViewElement(lpCard, lp);
+          lp.style.display = 'none';
+          if (lp.parentNode) {
+            lp.parentNode.insertBefore(lpCardEl, lp.nextSibling);
+            renderedCardsCount++;
+          }
+        }
+      }
+
+      // 3. 扫描正文普通段落中的裸标签（排除已在代码块里的内容）
       var mds = document.querySelectorAll('.ds-markdown');
       for (var m = 0; m < mds.length; m++) {
         var mdEl = mds[m];
         if (mdEl.dataset.dsxVcpTextScanned === '1') continue;
-        var fullText = mdEl.innerHTML || '';
-        if (fullText.includes('id="vcp-root"') || fullText.includes('id=&quot;vcp-root&quot;')) {
-          var unescaped = decodeHtmlEntities(fullText);
-          var vcpRe = /<div\b[^>]*\bid\s*=\s*["']vcp-root["'][^>]*>/i;
-          var match = vcpRe.exec(unescaped);
-          if (match) {
-            // 配平 div 标签
-            var startIdx = match.index;
-            var openEnd = match.index + match[0].length;
-            var depth = 1;
-            var tagRe = /<\/?div\b[^>]*>/gi;
-            tagRe.lastIndex = openEnd;
-            var tagMatch;
-            var endIdx = -1;
-            while ((tagMatch = tagRe.exec(unescaped)) !== null) {
-              if (tagMatch[0].charAt(1) === '/') depth--;
-              else depth++;
-              if (depth === 0) {
-                endIdx = tagRe.lastIndex;
-                break;
+
+        var paras = Array.prototype.slice.call(mdEl.querySelectorAll('p')).filter(function(p) {
+          return !p.closest('.md-code-block') && !p.closest('.dsx-vcp-card-wrapper');
+        });
+        if (!paras.length) continue;
+
+        var combinedHtml = paras.map(function(p) { return p.innerHTML || ''; }).join('\n');
+        if (combinedHtml.includes('id="vcp-root"') || combinedHtml.includes('id=&quot;vcp-root&quot;')) {
+          var unescaped = decodeHtmlEntities(combinedHtml);
+          var rawCard = extractCompleteHtmlCard(unescaped);
+          if (rawCard) {
+            mdEl.dataset.dsxVcpTextScanned = '1';
+            for (var p = 0; p < paras.length; p++) {
+              if (paras[p].textContent && paras[p].textContent.includes('vcp-root')) {
+                paras[p].style.display = 'none';
               }
             }
-            if (endIdx > startIdx) {
-              var cardHtml = unescaped.slice(startIdx, endIdx);
-              mdEl.dataset.dsxVcpTextScanned = '1';
-              // 找到含有 vcp-root 的段落并隐藏
-              var paras = mdEl.querySelectorAll('p, div');
-              for (var p = 0; p < paras.length; p++) {
-                if (paras[p].textContent && paras[p].textContent.includes('vcp-root')) {
-                  paras[p].style.display = 'none';
-                }
-              }
-              var cardNode = buildCardViewElement(cardHtml, null);
-              mdEl.appendChild(cardNode);
-              renderedCardsCount++;
-            }
+            var cardNode = buildCardViewElement(rawCard, null);
+            mdEl.appendChild(cardNode);
+            renderedCardsCount++;
           }
         }
       }
@@ -605,11 +666,23 @@ module.exports = {
 
     whenBodyReady(function () {
       if (isDisposed) return;
+      // 清理旧的遗留包装并还原元素
+      var oldWrappers = document.querySelectorAll('.dsx-vcp-card-wrapper');
+      for (var w = 0; w < oldWrappers.length; w++) {
+        if (oldWrappers[w].parentNode) oldWrappers[w].parentNode.removeChild(oldWrappers[w]);
+      }
+      var allProcessed = document.querySelectorAll('[data-dsx-vcp-processed="1"], [data-dsx-vcp-text-scanned="1"]');
+      for (var ap = 0; ap < allProcessed.length; ap++) {
+        allProcessed[ap].style.display = '';
+        delete allProcessed[ap].dataset.dsxVcpProcessed;
+        delete allProcessed[ap].dataset.dsxVcpTextScanned;
+      }
+
       setupUI();
       scanAndRender();
 
-      // 定期扫描与 UI 巡检
-      var scanInterval = ctx.every(400, function () {
+      // 定期扫描与 UI 巡检 (每 300ms 扫描一次，检测流式生成完成的卡片)
+      ctx.every(300, function () {
         if (isDisposed) return;
         if (!document.getElementById('vcp-float-btn') || !document.getElementById('vcp-hud-btn')) {
           setupUI();
@@ -631,7 +704,7 @@ module.exports = {
       if (panelEl && panelEl.parentNode) panelEl.parentNode.removeChild(panelEl);
       if (hudBtnEl && hudBtnEl.parentNode) hudBtnEl.parentNode.removeChild(hudBtnEl);
       if (floatBtnEl && floatBtnEl.parentNode) floatBtnEl.parentNode.removeChild(floatBtnEl);
-      // 还原所有隐藏的代码块
+      // 还原所有隐藏的原始代码块与段落
       var hiddenNodes = document.querySelectorAll('[data-dsx-vcp-processed="1"]');
       for (var i = 0; i < hiddenNodes.length; i++) {
         hiddenNodes[i].style.display = '';
@@ -643,7 +716,7 @@ module.exports = {
       }
     };
 
-    ctx.log('VCP HTML Card Render Plugin v2.0.0 已加载');
+    ctx.log('VCP HTML Card Render Plugin v2.1.0 已加载');
   },
 
   onUnload: function () {
