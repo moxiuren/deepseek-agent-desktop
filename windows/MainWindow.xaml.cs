@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -45,6 +46,10 @@ namespace DeepSeek
         // instead of being silently dropped (a drop leaves the planner waiting
         // forever and misattributes later results).
         private readonly SemaphoreSlim _execGate = new(1, 1);
+        // ---- Async lane (P1-b): background jobs bypass _execGate entirely.
+        // DSX cannot rebuild the host, so async execution must live here. ----
+        private readonly ConcurrentDictionary<string, AsyncJobEntry> _asyncJobs = new();
+        private static readonly TimeSpan AsyncJobMaxAge = TimeSpan.FromMinutes(30);
         private long _lastDropTimestamp = 0;
         private long _lastInjectTicks = 0;
 
@@ -97,6 +102,7 @@ namespace DeepSeek
                     App.Log($"[Runspace] init script warning: {ex.Message}");
                 }
 
+                try { EnsureThreadJobCompat(rs); } catch (Exception ex) { App.Log($"[Runspace] ThreadJob compat: {ex.Message}"); }
                 App.Log($"[Runspace] persistent runspace opened (cwd={workingDir})");
                 _runspace = rs;
                 return rs;
@@ -604,7 +610,9 @@ namespace DeepSeek
                     string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "";
                     if (!string.IsNullOrEmpty(cmd) && !string.IsNullOrEmpty(id))
                     {
-                        _ = ExecuteLocalCommandAsync(id, cmd);
+                        bool isAsync = root.TryGetProperty("async", out var asyncProp) && asyncProp.ValueKind == JsonValueKind.True;
+                        if (isAsync) { _ = StartAsyncJobAsync(id, cmd); }
+                        else { _ = ExecuteLocalCommandAsync(id, cmd); }
                     }
                 }
                 else if (action == "write_file")
@@ -615,6 +623,15 @@ namespace DeepSeek
                     if (!string.IsNullOrEmpty(path) && !string.IsNullOrEmpty(id))
                     {
                         _ = HandleFileWriteAsync(id, path, content);
+                    }
+                }
+                else if (action == "job_poll")
+                {
+                    string jobId = root.TryGetProperty("jobId", out var jProp) ? jProp.GetString() ?? "" : "";
+                    string pollId = root.TryGetProperty("id", out var iProp) ? iProp.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(jobId) && !string.IsNullOrEmpty(pollId))
+                    {
+                        _ = PollAsyncJobAsync(pollId, jobId);
                     }
                 }
                 else if (action == "paths_dropped")
@@ -657,6 +674,15 @@ namespace DeepSeek
                 else if (action == "test_clipboard_paste")
                 {
                     TryHandleFileDropClipboardPaste();
+                }
+                else if (action == "read_file")
+                {
+                    string path = root.TryGetProperty("path", out var rp) ? rp.GetString() ?? "" : "";
+                    string reqId = root.TryGetProperty("reqId", out var rid) ? rid.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(path) && !string.IsNullOrEmpty(reqId))
+                    {
+                        _ = HandleFileReadAsync(reqId, path);
+                    }
                 }
             }
             catch (Exception ex)
@@ -741,6 +767,83 @@ namespace DeepSeek
                     string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
                     await webView.CoreWebView2.ExecuteScriptAsync(js);
                 });
+            }
+        }
+
+        private async Task HandleFileReadAsync(string reqId, string path)
+        {
+            async Task ReplyAsync(bool ok, string content, string errMsg, long size, string resolvedPath)
+            {
+                await Dispatcher.InvokeAsync(async () =>
+                {
+                    try
+                    {
+                        var payload = new
+                        {
+                            reqId = reqId,
+                            ok = ok,
+                            content = content,
+                            size = size,
+                            path = resolvedPath,
+                            error = errMsg
+                        };
+                        string json = JsonSerializer.Serialize(payload);
+                        string js = $"window.__agentBridge && window.__agentBridge.onFileReadResult && window.__agentBridge.onFileReadResult({json});";
+                        await webView.CoreWebView2.ExecuteScriptAsync(js);
+                    }
+                    catch (Exception ex) { Trace.WriteLine($"[read_file reply error]: {ex.Message}"); }
+                });
+            }
+
+            try
+            {
+                string lower = path.ToLowerInvariant();
+                string[] denyPatterns = { ".env", "credential", "secret", ".pem", ".key", "id_rsa", "github_config.json", ".token", ".pfx", "password" };
+                foreach (var p in denyPatterns)
+                {
+                    if (lower.Contains(p))
+                    {
+                        App.Log($"[read_file] reject sensitive: {path}");
+                        await ReplyAsync(false, "", $"拒绝读取敏感文件: {path}", 0, path);
+                        return;
+                    }
+                }
+
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
+                string workingDir = Directory.Exists(projectsDir) ? projectsDir : userProfile;
+
+                string resolvedPath = path;
+                if (resolvedPath.StartsWith("~"))
+                {
+                    resolvedPath = Path.Combine(userProfile, resolvedPath.TrimStart('~', '/', '\\'));
+                }
+                else if (!Path.IsPathRooted(resolvedPath))
+                {
+                    resolvedPath = Path.Combine(workingDir, resolvedPath);
+                }
+
+                if (!File.Exists(resolvedPath))
+                {
+                    await ReplyAsync(false, "", $"文件不存在: {resolvedPath}", 0, resolvedPath);
+                    return;
+                }
+
+                var fi = new FileInfo(resolvedPath);
+                const long MaxBytes = 2 * 1024 * 1024;
+                if (fi.Length > MaxBytes)
+                {
+                    await ReplyAsync(false, "", $"文件过大 ({fi.Length} 字节 > {MaxBytes})", fi.Length, resolvedPath);
+                    return;
+                }
+
+                string content = await File.ReadAllTextAsync(resolvedPath, new UTF8Encoding(false));
+                await ReplyAsync(true, content, "", fi.Length, resolvedPath);
+                App.Log($"[read_file] OK: {resolvedPath} ({fi.Length}B)");
+            }
+            catch (Exception ex)
+            {
+                await ReplyAsync(false, "", $"读取失败: {ex.Message}", 0, path);
             }
         }
 
@@ -1233,6 +1336,202 @@ namespace DeepSeek
             }
         }
 
+        private sealed class AsyncJobEntry
+        {
+            public string JobId = "";
+            public DateTime StartedUtc = DateTime.UtcNow;
+            public Runspace? Rs;
+            public PowerShell? Ps;
+            public Task? RunTask;
+            public readonly StringBuilder Out = new();
+            public readonly StringBuilder Err = new();
+            public readonly object Sync = new();
+            public volatile bool Done;
+            public int ExitCode = -1;
+        }
+
+        private static string ThreadJobModuleDir()
+        {
+            try { return Path.Combine(AppContext.BaseDirectory, "Modules", "ThreadJob"); }
+            catch { return ""; }
+        }
+
+        // P2-b: make in-command Start-Job work inside the hosted runspace by shimming
+        // it onto Start-ThreadJob (same Job object model: Wait/Receive/Remove/Stop all work).
+        private void EnsureThreadJobCompat(Runspace rs)
+        {
+            try
+            {
+                string psd1 = Path.Combine(ThreadJobModuleDir(), "ThreadJob.psd1");
+                if (!File.Exists(psd1)) { App.Log("[Runspace] ThreadJob module not bundled, skipping compat"); return; }
+                Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
+                using (var ps = PowerShell.Create())
+                {
+                    ps.Runspace = rs;
+                    ps.AddScript($"Import-Module {q(psd1)} -Force -ErrorAction Stop; (Get-Command Start-ThreadJob -ErrorAction Stop) | Out-Null");
+                    ps.Invoke();
+                    if (ps.HadErrors) throw new InvalidOperationException("Start-ThreadJob not available after import");
+                    ps.Streams.ClearStreams();
+                }
+                using (var ps = PowerShell.Create())
+                {
+                    ps.Runspace = rs;
+                    ps.AddScript(@"
+function global:Start-Job {
+    [CmdletBinding(DefaultParameterSetName = 'sb')]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)] [scriptblock] $ScriptBlock,
+        [object[]] $ArgumentList,
+        [string] $Name,
+        [string] $WorkingDirectory
+    )
+    $sb = $ScriptBlock
+    if ($WorkingDirectory) {
+        $cd = ""Set-Location -LiteralPath '$($WorkingDirectory.Replace(""'"", ""''""))'; ""
+        $sb = [scriptblock]::Create($cd + $ScriptBlock.ToString())
+    }
+    $p = @{ ScriptBlock = $sb }
+    if ($ArgumentList) { $p.ArgumentList = $ArgumentList }
+    if ($Name) { $p.Name = $Name }
+    Start-ThreadJob @p
+}");
+                    ps.Invoke();
+                    if (ps.HadErrors) throw new InvalidOperationException("Start-Job shim install failed");
+                    ps.Streams.ClearStreams();
+                }
+                App.Log("[Runspace] ThreadJob compat ready (Start-Job -> Start-ThreadJob)");
+            }
+            catch (Exception ex) { App.Log($"[Runspace] ThreadJob compat unavailable: {ex.Message}"); }
+        }
+
+        private Runspace NewAgentRunspace()
+        {
+            var iss = InitialSessionState.CreateDefault();
+            iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+            iss.Commands.Add(new SessionStateCmdletEntry("Write-LiveStream", typeof(LiveStreamCmdlet), null));
+            var rs = RunspaceFactory.CreateRunspace(iss);
+            rs.Open();
+            try
+            {
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string projectsDir = Path.Combine(userProfile, "Documents", "Projects");
+                string workingDir = Directory.Exists(projectsDir) ? projectsDir : userProfile;
+                Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
+                using var init = PowerShell.Create();
+                init.Runspace = rs;
+                init.AddScript($"Set-Location -LiteralPath {q(workingDir)}");
+                init.Invoke();
+                init.Streams.ClearStreams();
+            }
+            catch (Exception ex) { App.Log($"[AsyncJob] runspace init warning: {ex.Message}"); }
+            try { EnsureThreadJobCompat(rs); } catch (Exception ex) { App.Log($"[AsyncJob] ThreadJob compat: {ex.Message}"); }
+            return rs;
+        }
+
+        // P1-b: async lane. Runs on a DEDICATED runspace + Task, never touches _execGate,
+        // so a 100s image task no longer blocks `dir`. Bridge polls via job_poll.
+        private async Task StartAsyncJobAsync(string id, string command)
+        {
+            string jobId = "dsx-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            var entry = new AsyncJobEntry { JobId = jobId };
+            try
+            {
+                entry.Rs = NewAgentRunspace();
+                var ps = PowerShell.Create();
+                ps.Runspace = entry.Rs;
+                ps.AddScript("$ProgressPreference='SilentlyContinue'; " + command);
+                entry.Ps = ps;
+                var outCol = new PSDataCollection<PSObject>();
+                outCol.DataAdded += (s, e) =>
+                {
+                    try
+                    {
+                        var c = s as PSDataCollection<PSObject>;
+                        if (c == null) return;
+                        lock (entry.Sync) { entry.Out.AppendLine(c[e.Index]?.ToString()); }
+                    }
+                    catch { }
+                };
+                ps.Streams.Error.DataAdded += (s, e) =>
+                {
+                    try
+                    {
+                        var c = s as PSDataCollection<ErrorRecord>;
+                        if (c == null) return;
+                        lock (entry.Sync) { entry.Err.AppendLine(FormatErrorRecord(c[e.Index])); }
+                    }
+                    catch { }
+                };
+                entry.RunTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        var ar = ps.BeginInvoke<PSObject, PSObject>(null, outCol);
+                        ar.AsyncWaitHandle.WaitOne();
+                        try { ps.EndInvoke(ar); } catch (Exception ex) { lock (entry.Sync) { entry.Err.AppendLine(ex.Message); } }
+                        entry.ExitCode = ps.HadErrors ? 1 : 0;
+                    }
+                    catch (Exception ex) { lock (entry.Sync) { entry.Err.AppendLine(ex.Message); } entry.ExitCode = -1; }
+                    finally { entry.Done = true; }
+                });
+                _asyncJobs[jobId] = entry;
+                App.Log($"[AsyncJob] started jobId={jobId} id={id}");
+                await FeedResultBackAsync(id, 0, $"[后台任务已启动 job={jobId}]\n命令在独立通道运行，不占执行队列。进度自动轮询，完成后结果送回会话。", jobId: jobId, asyncAck: true);
+            }
+            catch (Exception ex)
+            {
+                try { entry.Ps?.Dispose(); } catch { }
+                try { entry.Rs?.Dispose(); } catch { }
+                App.Log($"[AsyncJob] start FAILED jobId={jobId}: {ex.Message}");
+                await FeedResultBackAsync(id, 1, $"[后台任务启动失败] {ex.Message}");
+            }
+        }
+
+        private async Task PollAsyncJobAsync(string id, string jobId)
+        {
+            if (!_asyncJobs.TryGetValue(jobId, out var entry))
+            {
+                await FeedResultBackAsync(id, 1, $"[后台任务] job={jobId} 不存在（可能已完成并清理，或 app 重启后失效）。");
+                return;
+            }
+            if (!entry.Done && DateTime.UtcNow - entry.StartedUtc > AsyncJobMaxAge)
+            {
+                try { entry.Ps?.Stop(); } catch { }
+                entry.Done = true;
+                entry.ExitCode = 124;
+                lock (entry.Sync) { entry.Err.AppendLine("[后台任务超时中断 (超过 30 分钟)]"); }
+            }
+            string snapshot;
+            lock (entry.Sync)
+            {
+                snapshot = entry.Out.ToString();
+                if (entry.Err.Length > 0) snapshot += "\n[STDERR]:\n" + entry.Err.ToString();
+            }
+            if (snapshot.Length > 6000)
+            {
+                snapshot = snapshot.Substring(0, 3000)
+                    + $"\n...[中间 {snapshot.Length - 6000} 字符省略，完成后给全量]...\n"
+                    + snapshot.Substring(snapshot.Length - 3000);
+            }
+            if (!entry.Done)
+            {
+                await FeedResultBackAsync(id, 0, snapshot, jobId: jobId, jobRunning: true);
+                return;
+            }
+            _asyncJobs.TryRemove(jobId, out _);
+            try { entry.Ps?.Dispose(); } catch { }
+            try { entry.Rs?.Dispose(); } catch { }
+            string final = snapshot;
+            if (string.IsNullOrWhiteSpace(final)) final = "(后台任务完成，无终端文字输出)";
+            if (final.Length > 8000)
+            {
+                var (fbOut, fbPrompt, _) = await HandleOversizedOutputAsync(final);
+                final = fbOut + "\n\n" + fbPrompt;
+            }
+            App.Log($"[AsyncJob] done jobId={jobId} exit={entry.ExitCode}");
+            await FeedResultBackAsync(id, entry.ExitCode, final, jobId: jobId, jobDone: true);
+        }
+
         // DeepSeek's frontend React ErrorBoundary crashes when rendering uploaded
         // attachments near ~10MB (shows the extension "whale" page). Cap uploads.
         private const int MaxUploadBytes = 5 * 1024 * 1024;
@@ -1263,7 +1562,11 @@ namespace DeepSeek
             string? filename = null,
             string? mimeType = null,
             string? base64Data = null,
-            string? prompt = null)
+            string? prompt = null,
+            string? jobId = null,
+            bool jobRunning = false,
+            bool asyncAck = false,
+            bool jobDone = false)
         {
             if (App.DirectSendEnabled)
             {
@@ -1319,7 +1622,11 @@ namespace DeepSeek
                         filename = filename,
                         mimeType = mimeType,
                         base64Data = base64Data,
-                        prompt = prompt
+                        prompt = prompt,
+                        jobId = jobId,
+                        jobRunning = jobRunning,
+                        asyncAck = asyncAck,
+                        jobDone = jobDone
                     };
                     string jsonString = JsonSerializer.Serialize(payload);
                     string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";

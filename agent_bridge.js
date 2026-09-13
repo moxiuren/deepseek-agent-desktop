@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.5 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.7 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -63,6 +63,7 @@
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
 NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long tasks use detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log, then poll with Get-Content -Tail.
+ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (fence-line local_cmd:async). The command runs detached without blocking the queue; progress polls automatically; the final result returns to session. Quick commands stay sync.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律四条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连；④Exit:1 且报错含 not recognized / Unexpected token / Missing expression → 说明命令被提取错了，换写法重发，严禁原样重发。
@@ -97,6 +98,21 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
     const pendingDispatch = new Map();
     let lastDispatchAt = 0;
     const streamBuf = {};
+    // v4.3.7 async lane (P1-b): background job poll timers keyed by cardId.
+    const jobPollTimers = {};
+    function startJobPoll(cardId, jobId) {
+        try { if (jobPollTimers[cardId]) clearInterval(jobPollTimers[cardId]); } catch (_) {}
+        let n = 0;
+        jobPollTimers[cardId] = setInterval(() => {
+            n++;
+            if (n > 200 || !cardControllers[cardId]) {
+                try { clearInterval(jobPollTimers[cardId]); } catch (_) {}
+                try { delete jobPollTimers[cardId]; } catch (_) {}
+                return;
+            }
+            try { sendToNative({ action: 'job_poll', jobId: jobId, id: cardId }); } catch (_) {}
+        }, 3000);
+    }
     function queueFeedbackSlot(fn) {
         feedbackChain = feedbackChain.then(() => new Promise(resolve => {
             const start = Date.now();
@@ -843,6 +859,8 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
 
             if (!isLocalCmd && !isFileWrite) continue;
             foundAny = true;
+            // v4.3.7 async lane (P1-b): explicit `local_cmd:async` infostring routes to host background jobs.
+            const isAsyncCall = /local_cmd:async/i.test(bannerText + '\n' + firstLine) || /```\s*local_cmd:async/i.test(fullText);
 
             let cleanCmd = "";
             let fileContent = "";
@@ -959,11 +977,11 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
                 console.log("[Agent Bridge] Complete Tool Call Detected:\n", cleanCmd);
 
                 const controller = renderToolCallCard(parent, cleanCmd, (cmd, ctrl) => {
-                    executeCommand(cmd, ctrl);
+                    executeCommand(cmd, ctrl, { async: isAsyncCall });
                 }, 'cmd');
 
                 if (autoExecute && !isExecutingNow) {
-                    executeCommand(cleanCmd, controller);
+                    executeCommand(cleanCmd, controller, { async: isAsyncCall });
                     break;
                 }
             }
@@ -993,6 +1011,8 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
 
                 const writeMatch = scopeText.match(writeFenceRe);
                 const cmdMatch = !writeMatch ? scopeText.match(cmdFenceRe) : null;
+                // v4.3.7 async lane (P1-b): explicit fenced `local_cmd:async` infostring.
+                const isAsyncCall = /```\s*local_cmd:async/i.test(scopeText);
 
                 if (writeMatch) {
                     const rawPath = writeMatch[1];
@@ -1061,11 +1081,11 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
                                     blockWatchMap.delete(scanScope);
                                     console.log("[Agent Bridge] [Scope Fallback] Complete Tool Call Detected:\n", cleanCmd);
                                     const controller = renderToolCallCard(scanScope, cleanCmd, (cmd, ctrl) => {
-                                        executeCommand(cmd, ctrl);
+                                        executeCommand(cmd, ctrl, { async: isAsyncCall });
                                     }, 'cmd');
 
                                     if (autoExecute && !isExecutingNow) {
-                                        executeCommand(cleanCmd, controller);
+                                        executeCommand(cleanCmd, controller, { async: isAsyncCall });
                                     }
                                 }
                             } else {
@@ -1079,7 +1099,7 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
     }
 
     // 4. Execute Command via Native Swift / Host
-    function executeCommand(command, controller) {
+    function executeCommand(command, controller, opts) {
         if (isExecutingNow) return;
 
         // Dispatch dedup: streaming re-renders can surface the same block twice
@@ -1089,7 +1109,7 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.5', cmd: normCmd.slice(0, 80) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.7', cmd: normCmd.slice(0, 80) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1148,11 +1168,14 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
             return;
         }
 
-        sendToNative({
+        const outMsg = {
             action: "execute",
             command: command,
             id: controller.cardId
-        });
+        };
+        // v4.3.7 async lane (P1-b): explicit detached execution, bypasses host serial queue.
+        if (opts && opts.async) outMsg.async = true;
+        sendToNative(outMsg);
     }
 
     // 4b. Direct File Write via Native Host
@@ -1638,10 +1661,25 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
             executingStartedAt = 0;
             const cardId = data.id;
             const exitCode = data.exitCode;
+            // v4.3.7 async lane (P1-b): poll heartbeats update the card only; the final
+            // jobDone result flows through the normal pipeline (pending kept until then).
+            const isAsyncAck = !!data.asyncAck;
+            const isJobPoll = !!data.jobPoll;
+            if (data.jobId && data.jobDone) { try { if (jobPollTimers[cardId]) clearInterval(jobPollTimers[cardId]); } catch (_) {} try { delete jobPollTimers[cardId]; } catch (_) {} }
+            if (isJobPoll && !data.jobDone) {
+                try { const cj = cardControllers[cardId]; if (cj) { cj.setStatus('后台运行中…', '#2563eb', true); cj.setOutput(String(data.output || ''), false); } } catch (_) {}
+                isExecutingNow = false;
+                isFeedbackPending = false;
+                feedbackPendingStartedAt = 0;
+                return;
+            }
+            if (isAsyncAck && data.jobId) { try { startJobPoll(cardId, data.jobId); } catch (_) {} }
             // v4.3.4 receipt integrity (P1.3): dispatch→result correlation + stream fallback.
             // Unknown ids = stale replays: drop WITHOUT feedback (kills 错位/回放进会话).
             const pend = pendingDispatch.get(cardId);
-            try { pendingDispatch.delete(cardId); } catch (_) {}
+            // v4.3.7: asyncAck must NOT consume the pending entry — the final jobDone
+            // result still needs it to pass the receipt-integrity gate.
+            if (!isAsyncAck) { try { pendingDispatch.delete(cardId); } catch (_) {} }
             let streamedText = '';
             try { streamedText = String(streamBuf[cardId] || ''); delete streamBuf[cardId]; } catch (_) {}
             if (!String((data && data.output) || '').trim() && streamedText.trim()) {

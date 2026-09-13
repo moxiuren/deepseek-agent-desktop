@@ -8,7 +8,7 @@
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <AssemblyName>DeepSeek</AssemblyName>
     <RootNamespace>DeepSeek</RootNamespace>
-    <Version>1.0.6</Version>
+    <Version>1.0.7</Version>
     <Authors>moxiuren</Authors>
     <Product>DeepSeek for Windows</Product>
     <Description>Native Windows desktop client for DeepSeek with autonomous local Agent closed-loop execution</Description>
@@ -30,6 +30,8 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <EmbeddedResource Include="..\agent_bridge.js" Link="Resources\agent_bridge.js" />
+    <!-- ThreadJob module (Start-ThreadJob backend for Start-Job shim + async lane): ship beside the exe -->
+    <None Include="Modules\**" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\api_sniff.js" Link="api_sniff.js">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
