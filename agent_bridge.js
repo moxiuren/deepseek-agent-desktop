@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.8 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.9 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1109,7 +1109,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.8', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.9', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1849,7 +1849,21 @@ ${output}
                         // Slot covers injectPrompt's internal 500ms delayed click;
                         // verify the send actually left instead of assuming.
                         setTimeout(() => {
-                            verifySentOrRetry((ok) => { release(!!ok); });
+                            verifySentOrRetry((ok) => {
+                                if (ok) { release(true); return; }
+                                // v4.3.9: one re-fill retry, then FAIL VISIBLY (never silent-drop).
+                                // Covers the lost-async-final class: result died between card and composer.
+                                try { injectPrompt(feedback, true); } catch (_) {}
+                                setTimeout(() => {
+                                    verifySentOrRetry((ok2) => {
+                                        release(!!ok2);
+                                        if (!ok2 && controller) {
+                                            try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
+                                            try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
+                                        }
+                                    }, true);
+                                }, 700);
+                            }, true);
                         }, 700);
                         setTimeout(() => {
                             updateHUD("Tool Call 引擎就绪", "#10b981");
@@ -2075,7 +2089,9 @@ ${output}
     // Verify the click actually sent (a completion request left the page);
     // if our text is still sitting in the box, click again (max ~6s).
     // Without this, a swallowed click leaves text "stuck" with no retry.
-    function verifySentOrRetry(done) {
+    // v4.3.9 no-silent-loss: strict mode passes ONLY when a completion actually left
+    // (the vacuous `!ours` pass could confirm a send that never filled the box).
+    function verifySentOrRetry(done, strict) {
         let ack0 = 0;
         try { ack0 = window.__lastCompletionAt || 0; } catch (_) {}
         const t0 = Date.now();
@@ -2092,7 +2108,7 @@ ${output}
                 if (ta) v = (ta.value !== undefined ? ta.value : ta.innerText) || '';
                 ours = !!(v && v.indexOf('[Tool Call') === 0);
             } catch (_) {}
-            if (cur > ack0 || !ours) {
+            if (cur > ack0 || (!strict && !ours)) {
                 try { clearInterval(iv); } catch (_) {}
                 diagAttach({ phase: 'sent-ack', elapsed: Date.now() - t0, clicks: clicks });
                 try { done(true); } catch (_) {}
