@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -8,13 +8,13 @@
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <AssemblyName>DeepSeek</AssemblyName>
     <RootNamespace>DeepSeek</RootNamespace>
-    <Version>1.0.5</Version>
+    <Version>1.0.6</Version>
     <Authors>moxiuren</Authors>
     <Product>DeepSeek for Windows</Product>
     <Description>Native Windows desktop client for DeepSeek with autonomous local Agent closed-loop execution</Description>
-    <!-- 必须多文件发布：Microsoft.PowerShell.SDK 的 InitialSessionState.CreateDefault()
-         依赖 Assembly.Location 定位模块目录，单文件发布下 Location 为空导致
-         "Value cannot be null. (Parameter 'path1')"，所有命令退出码 -1 -->
+    <!-- 蹇呴』澶氭枃浠跺彂甯冿細Microsoft.PowerShell.SDK 鐨?InitialSessionState.CreateDefault()
+         渚濊禆 Assembly.Location 瀹氫綅妯″潡鐩綍锛屽崟鏂囦欢鍙戝竷涓?Location 涓虹┖瀵艰嚧
+         "Value cannot be null. (Parameter 'path1')"锛屾墍鏈夊懡浠ら€€鍑虹爜 -1 -->
     <PublishSingleFile>false</PublishSingleFile>
   </PropertyGroup>
 
@@ -36,3 +36,4 @@
   </ItemGroup>
 
 </Project>
+

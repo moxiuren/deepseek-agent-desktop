@@ -1,9 +1,9 @@
-; DeepSeek Agent for Windows - Inno Setup script
+﻿; DeepSeek Agent for Windows - Inno Setup script
 ; Usage: ISCC.exe DeepSeek-Agent.iss   (run from windows\installer\)
 ; NOTE: run a fresh `dotnet publish ... -o ..\publish` first so ..\publish is current.
 
 #define MyAppName "DeepSeek Agent"
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "moxiuren"
 #define MyAppExeName "DeepSeek.exe"
 #define SrcDir "..\publish"
@@ -18,7 +18,7 @@ DefaultDirName={localappdata}\DeepSeek-Agent
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\..\dist
-OutputBaseFilename=DeepSeek-Agent-Setup-1.0.5
+OutputBaseFilename=DeepSeek-Agent-Setup-1.0.6
 SetupIconFile=..\AppIcon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
@@ -34,15 +34,13 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
-chinesesimplified.LaunchAfterInstall=安装完成后启动 DeepSeek Agent
+chinesesimplified.LaunchAfterInstall=瀹夎瀹屾垚鍚庡惎鍔?DeepSeek Agent
 english.LaunchAfterInstall=Launch DeepSeek Agent after install
-chinesesimplified.PrereqDotNet=正在安装 .NET 8 Desktop Runtime（约1分钟）…
-english.PrereqDotNet=Installing .NET 8 Desktop Runtime (about 1 minute)...
-chinesesimplified.PrereqWebView2=正在安装 WebView2 运行库（需联网下载）…
-english.PrereqWebView2=Installing WebView2 Runtime (download required)...
-chinesesimplified.DotNetFailed=.NET 8 安装失败（退出码 %1）。可稍后手动安装：https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe
+chinesesimplified.PrereqDotNet=姝ｅ湪瀹夎 .NET 8 Desktop Runtime锛堢害1鍒嗛挓锛夆€?english.PrereqDotNet=Installing .NET 8 Desktop Runtime (about 1 minute)...
+chinesesimplified.PrereqWebView2=姝ｅ湪瀹夎 WebView2 杩愯搴擄紙闇€鑱旂綉涓嬭浇锛夆€?english.PrereqWebView2=Installing WebView2 Runtime (download required)...
+chinesesimplified.DotNetFailed=.NET 8 瀹夎澶辫触锛堥€€鍑虹爜 %1锛夈€傚彲绋嶅悗鎵嬪姩瀹夎锛歨ttps://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe
 english.DotNetFailed=.NET 8 install failed (exit code %1). Install manually later: https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe
-chinesesimplified.WebView2Failed=WebView2 安装失败（退出码 %1）。可稍后手动安装：https://go.microsoft.com/fwlink/p/?LinkId=2124703
+chinesesimplified.WebView2Failed=WebView2 瀹夎澶辫触锛堥€€鍑虹爜 %1锛夈€傚彲绋嶅悗鎵嬪姩瀹夎锛歨ttps://go.microsoft.com/fwlink/p/?LinkId=2124703
 english.WebView2Failed=WebView2 install failed (exit code %1). Install manually later: https://go.microsoft.com/fwlink/p/?LinkId=2124703
 
 [Tasks]
@@ -156,3 +154,4 @@ begin
   if CurUninstallStep = usUninstall then
     KillRunningApp();
 end;
+
