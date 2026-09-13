@@ -1,14 +1,93 @@
-Write-Warning -Message "The ThreadJob module has been renamed to Microsoft.PowerShell.ThreadJob. The ThreadJob module will no longer be included with PowerShell as of 7.6 and above."
+﻿#
+# Module manifest for module 'Microsoft.PowerShell.ThreadJob'
+#
 
-Set-Alias -Name Start-ThreadJob -Value Microsoft.PowerShell.ThreadJob\Start-ThreadJob
+@{
 
-Export-ModuleMember -Alias Start-ThreadJob
+# Script module or binary module file associated with this manifest.
+RootModule = '.\Microsoft.PowerShell.ThreadJob.dll'
+
+# Version number of this module.
+ModuleVersion = '2.2.0'
+
+# ID used to uniquely identify this module
+GUID = 'a84b375d-c1d6-4a1c-bcb7-8059bc28cd98'
+
+Author = 'Microsoft Corporation'
+CompanyName = 'Microsoft Corporation'
+Copyright = '(c) Microsoft Corporation. All rights reserved.'
+
+# Description of the functionality provided by this module
+Description = "
+PowerShell's built-in BackgroundJob jobs (Start-Job) are run in separate processes on the local machine.
+They provide excellent isolation but are resource heavy.  Running hundreds of BackgroundJob jobs can quickly
+absorb system resources.
+
+This module extends the existing PowerShell BackgroundJob to include a new thread based ThreadJob job.  This is a 
+lighter weight solution for running concurrent PowerShell scripts that works within the existing PowerShell job 
+infrastructure.
+
+ThreadJob jobs will tend to run quicker because there is lower overhead and they do not use the remoting serialization 
+system.  And they will use up fewer system resources.  In addition output objects returned from the job will be
+'live' since they are not re-hydrated from the serialization system.  However, there is less isolation.  If one
+ThreadJob job crashes the process then all ThreadJob jobs running in that process will be terminated.
+
+This module exports a single cmdlet, Start-ThreadJob, which works similarly to the existing Start-Job cmdlet.
+The main difference is that the jobs which are created run in separate threads within the local process.
+
+One difference is that ThreadJob jobs support a ThrottleLimit parameter to limit the number of running jobs,
+and thus active threads, at a time.  If more jobs are started then they go into a queue and wait until the current
+number of jobs drops below the throttle limit.
+"
+
+# Minimum version of the Windows PowerShell engine required by this module
+PowerShellVersion = '5.1'
+
+# Cmdlets to export from this module
+CmdletsToExport = 'Start-ThreadJob'
+
+# Private data to pass to the module specified in RootModule/ModuleToProcess. This may also contain a PSData hashtable with additional module metadata used by PowerShell.
+PrivateData = @{
+
+    PSData = @{
+
+        # Tags applied to this module. These help with module discovery in online galleries.
+        # Tags = @()
+
+        # A URL to the license for this module.
+        # LicenseUri = 'https://github.com/Powershell/ThreadJob/blob/master/LICENSE'
+
+        # A URL to the main website for this project.
+        ProjectUri = 'https://github.com/Powershell/ThreadJob'
+
+        # A URL to an icon representing this module.
+        # IconUri = ''
+
+        # ReleaseNotes of this module
+        # ReleaseNotes = ''
+
+        # Prerelease string of this module
+        # Prerelease = ''
+
+        # Flag to indicate whether the module requires explicit user acceptance for install/update/save
+        # RequireLicenseAcceptance = $false
+
+        # External dependent modules of this module
+        # ExternalModuleDependencies = @()
+    } # End of PSData hashtable
+
+} # End of PrivateData hashtable
+
+# A URL to get more information about this module
+HelpInfoURI = 'https://go.microsoft.com/fwlink/?linkid=2305300'
+
+}
 
 # SIG # Begin signature block
-# MIIoLQYJKoZIhvcNAQcCoIIoHjCCKBoCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIIoKQYJKoZIhvcNAQcCoIIoGjCCKBYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC7QNAPEmeRkKEB
-# Ghn00E+LrbhUgmanAUz3lANB4ZH8fKCCDXYwggX0MIID3KADAgECAhMzAAAEBGx0
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAC9brh3FFT9MBQ
+# 6X2lDmlerNpMLEkjjkKq1aVafVXe1qCCDXYwggX0MIID3KADAgECAhMzAAAEBGx0
 # Bv9XKydyAAAAAAQEMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -80,67 +159,67 @@ Export-ModuleMember -Alias Start-ThreadJob
 # XJbYANahRr1Z85elCUtIEJmAH9AAKcWxm6U/RXceNcbSoqKfenoi+kiVH6v7RyOA
 # 9Z74v2u3S5fi63V4GuzqN5l5GEv/1rMjaHXmr/r8i+sLgOppO6/8MO0ETI7f33Vt
 # Y5E90Z1WTk+/gFcioXgRMiF670EKsT/7qMykXcGhiJtXcVZOSEXAQsmbdlsKgEhr
-# /Xmfwb1tbWrJUnMTDXpQzTGCGg0wghoJAgEBMIGVMH4xCzAJBgNVBAYTAlVTMRMw
+# /Xmfwb1tbWrJUnMTDXpQzTGCGgkwghoFAgEBMIGVMH4xCzAJBgNVBAYTAlVTMRMw
 # EQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVN
 # aWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNp
 # Z25pbmcgUENBIDIwMTECEzMAAAQEbHQG/1crJ3IAAAAABAQwDQYJYIZIAWUDBAIB
 # BQCgga4wGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
-# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIBvR6VzBFs0trr4ka5fgWenu
-# 6xccxxz77vkc9KD26wd+MEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIFtT6Y+576GN3Y1vufYrc9At
+# DyWx1TKUdrEm9Aah1hW1MEIGCisGAQQBgjcCAQwxNDAyoBSAEgBNAGkAYwByAG8A
 # cwBvAGYAdKEagBhodHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20wDQYJKoZIhvcNAQEB
-# BQAEggEAm70JXXDpvNGVhdva1VyTbfWl91+Dy8OphZRpVeH+L5loO4CyR0XYKvFP
-# +kvzakNppd3PM/o2xddywkNa/BtPmPw5CTEpIablMaSkrLv2+w+LW4BFVncIc/5+
-# GTKSX8OgxPiG6rB2Dao9THGK0YVns67YF7gj1Oj+x1w7zR0mNaAY4X24fAbM6dZR
-# ykEPGX4I5/k4kvxH4DhXnQtMSV+gXiKyAXPrXHQA0NpaJggJMPDQ1GD7NLXbxdBC
-# BS/eZeUUVzZqJUnmvD4iFmy/7ZKo1aqSTDVrL/kKI4h6bsQJt+ILtgLaqb/tHWrX
-# hBUVnPFmOXkfrPFcrWeKKci/JoBlP6GCF5cwgheTBgorBgEEAYI3AwMBMYIXgzCC
-# F38GCSqGSIb3DQEHAqCCF3AwghdsAgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFSBgsq
+# BQAEggEACygAcVQdQdEASxwxQ8Y9DTPZ7+ndXzu5XcPwlR4FjWCvUaLa6TFtz6rP
+# EWgDvxtk//HSteotSdDlISQHXAw3C9vrJidARPyGxhCDUsKNoP3ifLn54lHZTYg5
+# YXYle8GG+HaPW0f+63wlgho7/n5oF9YGe2X9Mrw/GRFNWI71Lt8dhAMkJuS5ewdf
+# rrzvdki3JkfI86JbcXgHKQUGPS2G+JcNuepmugPELvaQdaKykiMXNVpC6690AEp5
+# vOkuZcBeioESQyvNRHCzo/k+ys4zAdNGtcyLQwG92FhlTEksmyiLij5znbKPgDq7
+# pY+epyw/nFJmooOvVt0bZBPPGN3266GCF5MwghePBgorBgEEAYI3AwMBMYIXfzCC
+# F3sGCSqGSIb3DQEHAqCCF2wwghdoAgEDMQ8wDQYJYIZIAWUDBAIBBQAwggFSBgsq
 # hkiG9w0BCRABBKCCAUEEggE9MIIBOQIBAQYKKwYBBAGEWQoDATAxMA0GCWCGSAFl
-# AwQCAQUABCCnipx2k9QJVpe8gaszzggb3Lz1Dn3rKP2WA7xR4R74ngIGZ7epUu1L
-# GBMyMDI1MDMwNjE2NDc0OS44NzdaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
+# AwQCAQUABCCVM+v9dIkzSd8U9s295xhAkpsPZF+incQp+RSLUd+dpgIGZ7epWJBN
+# GBMyMDI1MDMwNjE2NDc1OC4wMDlaMASAAgH0oIHRpIHOMIHLMQswCQYDVQQGEwJV
 # UzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UE
 # ChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1l
-# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0w
+# cmljYSBPcGVyYXRpb25zMScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046ODkwMC0w
 # NUUwLUQ5NDcxJTAjBgNVBAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2Wg
-# ghHtMIIHIDCCBQigAwIBAgITMwAAAgbXvFE4mCPsLAABAAACBjANBgkqhkiG9w0B
+# ghHpMIIHIDCCBQigAwIBAgITMwAAAg4syyh9lSB1YwABAAACDjANBgkqhkiG9w0B
 # AQsFADB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UE
 # BxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYD
-# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNTAxMzAxOTQy
-# NTBaFw0yNjA0MjIxOTQyNTBaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
+# VQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMDAeFw0yNTAxMzAxOTQz
+# MDNaFw0yNjA0MjIxOTQzMDNaMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
 # aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
 # cnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25z
-# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046N0YwMC0wNUUwLUQ5NDcxJTAjBgNV
+# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046ODkwMC0wNUUwLUQ5NDcxJTAjBgNV
 # BAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2UwggIiMA0GCSqGSIb3DQEB
-# AQUAA4ICDwAwggIKAoICAQDpRIWbIM3Rlr397cjHaYx85l7I+ZVWGMCBCM911BpU
-# 6+IGWCqksqgqefZFEjKzNVDYC9YcgITAz276NGgvECm4ZfNv/FPwcaSDz7xbDbsO
-# oxbwQoHUNRro+x5ubZhT6WJeU97F06+vDjAw/Yt1vWOgRTqmP/dNr9oqIbE5oCLY
-# dH3wI/noYmsJVc7966n+B7UAGAWU2se3Lz+xdxnNsNX4CR6zIMVJTSezP/2STNcx
-# JTu9k2sl7/vzOhxJhCQ38rdaEoqhGHrXrmVkEhSv+S00DMJc1OIXxqfbwPjMqEVp
-# 7K3kmczCkbum1BOIJ2wuDAbKuJelpteNZj/S58NSQw6khfuJAluqHK3igkS/Oux4
-# 9qTP+rU+PQeNuD+GtrCopFucRmanQvxISGNoxnBq3UeDTqphm6aI7GMHtFD6DOjJ
-# lllH1gVWXPTyivf+4tN8TmO6yIgB4uP00bH9jn/dyyxSjxPQ2nGvZtgtqnvq3h3T
-# RjRnkc+e1XB1uatDa1zUcS7r3iodTpyATe2hgkVX3m4DhRzI6A4SJ6fbJM9isLH8
-# AGKcymisKzYupAeFSTJ10JEFa6MjHQYYohoCF77R0CCwMNjvE4XfLHu+qKPY8GQf
-# sZdigQ9clUAiydFmVt61hytoxZP7LmXbzjD0VecyzZoL4Equ1XszBsulAr5Ld2Kw
-# cwIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFO0wsLKdDGpT97cx3Iymyo/SBm4SMB8G
+# AQUAA4ICDwAwggIKAoICAQCs5t7iRtXt0hbeo9ME78ZYjIo3saQuWMBFQ7X4s9vo
+# oYRABTOf2poTHatx+EwnBUGB1V2t/E6MwsQNmY5XpM/75aCrZdxAnrV9o4Tu5sBe
+# pbbfehsrOWRBIGoJE6PtWod1CrFehm1diz3jY3H8iFrh7nqefniZ1SnbcWPMyNIx
+# uGFzpQiDA+E5YS33meMqaXwhdb01Cluymh/3EKvknj4dIpQZEWOPM3jxbRVAYN5J
+# 2tOrYkJcdDx0l02V/NYd1qkvUBgPxrKviq5kz7E6AbOifCDSMBgcn/X7RQw630Qk
+# zqhp0kDU2qei/ao9IHmuuReXEjnjpgTsr4Ab33ICAKMYxOQe+n5wqEVcE9OTyhmW
+# ZJS5AnWUTniok4mgwONBWQ1DLOGFkZwXT334IPCqd4/3/Ld/ItizistyUZYsml/C
+# 4ZhdALbvfYwzv31Oxf8NTmV5IGxWdHnk2Hhh4bnzTKosEaDrJvQMiQ+loojM7f5b
+# gdyBBnYQBm5+/iJsxw8k227zF2jbNI+Ows8HLeZGt8t6uJ2eVjND1B0YtgsBP0cs
+# BlnnI+4+dvLYRt0cAqw6PiYSz5FSZcbpi0xdAH/jd3dzyGArbyLuo69HugfGEEb/
+# sM07rcoP1o3cZ8eWMb4+MIB8euOb5DVPDnEcFi4NDukYM91g1Dt/qIek+rtE88VS
+# 8QIDAQABo4IBSTCCAUUwHQYDVR0OBBYEFIVxRGlSEZE+1ESK6UGI7YNcEIjbMB8G
 # A1UdIwQYMBaAFJ+nFV0AXmJdg/Tl0mWnG1M1GelyMF8GA1UdHwRYMFYwVKBSoFCG
 # Tmh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY3JsL01pY3Jvc29mdCUy
 # MFRpbWUtU3RhbXAlMjBQQ0ElMjAyMDEwKDEpLmNybDBsBggrBgEFBQcBAQRgMF4w
 # XAYIKwYBBQUHMAKGUGh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY2Vy
 # dHMvTWljcm9zb2Z0JTIwVGltZS1TdGFtcCUyMFBDQSUyMDIwMTAoMSkuY3J0MAwG
 # A1UdEwEB/wQCMAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwDgYDVR0PAQH/BAQD
-# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQB23GZOfe9ThTUvD29i4t6lDpxJhpVRMme+
-# UbyZhBFCZhoGTtjDdphAArU2Q61WYg3YVcl2RdJm5PUbZ2bA77zk+qtLxC+3dNxV
-# sTcdtxPDSSWgwBHxTj6pCmoDNXolAYsWpvHQFCHDqEfAiBxX1dmaXbiTP1d0Xffv
-# gR6dshUcqaH/mFfjDZAxLU1s6HcVgCvBQJlJ7xEG5jFKdtqapKWcbUHwTVqXQGbI
-# lHVClNJ3yqW6Z3UJH/CFcYiLV/e68urTmGtiZxGSYb4SBSPArTrTYeHOlQIj/7lo
-# VWmfWX2y4AGV/D+MzyZMyvFw4VyL0Vgq96EzQKyteiVeBaVEjxQKo3AcPULRF4Uz
-# z98P2tCM5XbFZ3Qoj9PLg3rgFXr0oJEhfh2tqUrhTJd13+i4/fek9zWicoshlwXg
-# Fu002ZWBVzASEFuqED48qyulZ/2jGJBcta+Fdk2loP2K3oSj4PQQe1MzzVZO52AX
-# O42MHlhm3SHo3/RhQ+I1A0Ny+9uAehkQH6LrxkrVNvZG4f0PAKMbqUcXG7xznKJ0
-# x0HYr5ayWGbHKZRcObU+/34ZpL9NrXOedVDXmSd2ylKSl/vvi1QwNJqXJl/+gJkQ
-# EetqmHAUFQkFtemi8MUXQG2w/RDHXXwWAjE+qIDZLQ/k4z2Z216tWaR6RDKHGkwe
-# CoDtQtzkHTCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
+# AgeAMA0GCSqGSIb3DQEBCwUAA4ICAQB14L2TL+L8OXLxnGSal2h30mZ7FsBFooiY
+# kUVOY05F9pnwPTVufEDGWEpNNy2OfaUHWIOoQ/9/rjwO0hS2SpB0BzMAk2gyz92N
+# GWOpWbpBdMvrrRDpiWZi/uLS4ZGdRn3P2DccYmlkNP+vaRAXvnv+mp27KgI79mJ9
+# hGyCQbvtMIjkbYoLqK7sF7Wahn9rLjX1y5QJL4lvEy3QmA9KRBj56cEv/lAvzDq7
+# eSiqRq/pCyqyc8uzmQ8SeKWyWu6DjUA9vi84QsmLjqPGCnH4cPyg+t95RpW+73sn
+# hew1iCV+wXu2RxMnWg7EsD5eLkJHLszUIPd+XClD+FTvV03GfrDDfk+45flH/eKR
+# Zc3MUZtnhLJjPwv3KoKDScW4iV6SbCRycYPkqoWBrHf7SvDA7GrH2UOtz1Wa1k27
+# sdZgpG6/c9CqKI8CX5vgaa+A7oYHb4ZBj7S8u8sgxwWK7HgWDRByOH3CiJu4LJ8h
+# 3TiRkRArmHRp0lbNf1iAKuL886IKE912v0yq55t8jMxjBU7uoLsrYVIoKkzh+sAk
+# gkpGOoZL14+dlxVM91Bavza4kODTUlwzb+SpXsSqVx8nuB6qhUy7pqpgww1q4SNh
+# AxFnFxsxiTlaoL75GNxPR605lJ2WXehtEi7/+YfJqvH+vnqcpqCjyQ9hNaVzuOEH
+# X4MyuqcjwjCCB3EwggVZoAMCAQICEzMAAAAVxedrngKbSZkAAAAAABUwDQYJKoZI
 # hvcNAQELBQAwgYgxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAw
 # DgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24x
 # MjAwBgNVBAMTKU1pY3Jvc29mdCBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAy
@@ -179,45 +258,45 @@ Export-ModuleMember -Alias Start-ThreadJob
 # GSgkujhLmm77IVRrakURR6nxt67I6IleT53S0Ex2tVdUCbFpAUR+fKFhbHP+Crvs
 # QWY9af3LwUFJfn6Tvsv4O+S3Fb+0zj6lMVGEvL8CwYKiexcdFYmNcP7ntdAoGokL
 # jzbaukz5m/8K6TT4JDVnK+ANuOaMmdbhIurwJ0I9JZTmdHRbatGePu1+oDEzfbzL
-# 6Xu/OHBE0ZDxyKs6ijoIYn/ZcGNTTY3ugm2lBRDBcQZqELQdVTNYs6FwZvKhggNQ
-# MIICOAIBATCB+aGB0aSBzjCByzELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hp
+# 6Xu/OHBE0ZDxyKs6ijoIYn/ZcGNTTY3ugm2lBRDBcQZqELQdVTNYs6FwZvKhggNM
+# MIICNAIBATCB+aGB0aSBzjCByzELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hp
 # bmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jw
 # b3JhdGlvbjElMCMGA1UECxMcTWljcm9zb2Z0IEFtZXJpY2EgT3BlcmF0aW9uczEn
-# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOjdGMDAtMDVFMC1EOTQ3MSUwIwYDVQQD
-# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQAE
-# a0f118XHM/VNdqKBs4QXxNnN96CBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
+# MCUGA1UECxMeblNoaWVsZCBUU1MgRVNOOjg5MDAtMDVFMC1EOTQ3MSUwIwYDVQQD
+# ExxNaWNyb3NvZnQgVGltZS1TdGFtcCBTZXJ2aWNloiMKAQEwBwYFKw4DAhoDFQBK
+# 6HY/ZWLnOcMEQsjkDAoB/JZWCKCBgzCBgKR+MHwxCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1w
-# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA63PzMDAiGA8yMDI1MDMwNjEwMTA1
-# NloYDzIwMjUwMzA3MTAxMDU2WjB3MD0GCisGAQQBhFkKBAExLzAtMAoCBQDrc/Mw
-# AgEAMAoCAQACAgd4AgH/MAcCAQACAhJPMAoCBQDrdUSwAgEAMDYGCisGAQQBhFkK
-# BAIxKDAmMAwGCisGAQQBhFkKAwKgCjAIAgEAAgMHoSChCjAIAgEAAgMBhqAwDQYJ
-# KoZIhvcNAQELBQADggEBADswsPhSXIV1xhHdfzYxkWrZDyWa1ECNg7zEDMPzx1ue
-# lVXEMTHMT5mdHufOo4dOw+RrgjZjUSpwPJ1WJ3ZE23UkRf5zpmd9jzs9kXtLM8y0
-# jl9bguxW8xz+1RKnHC/jz7rBifY6wqLavCUO4dm4yIccYu9wvy1Q95M/dFllrFpz
-# h49/ZgCSvQJ4HyaiTo79cSVqqSK0IOjQ5MlGEcMfzNmC8ItoJvsEPqqM3OzjRKIl
-# I5KMOhp9HIZz/Eo4i7WWSXhA6H6w63qq/KYQeQRrGG2vsuwIu9nEcyFH14Mb9cEm
-# PxacM+Pbi2LZsUQBHDZqzADrIVXMsymQOft5697hmbgxggQNMIIECQIBATCBkzB8
-# MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVk
-# bW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSYwJAYDVQQDEx1N
-# aWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAxMAITMwAAAgbXvFE4mCPsLAABAAAC
-# BjANBglghkgBZQMEAgEFAKCCAUowGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEE
-# MC8GCSqGSIb3DQEJBDEiBCARF8L52ExxfKiMnefuNV2jeR/7WttLXIP9AwpiDRiR
-# sTCB+gYLKoZIhvcNAQkQAi8xgeowgecwgeQwgb0EIODo9ZSIkZ6dVtKT+E/uZx2W
-# Ay7KiXM5R1JIOhNJf0vSMIGYMIGApH4wfDELMAkGA1UEBhMCVVMxEzARBgNVBAgT
-# Cldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29m
-# dCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUtU3RhbXAgUENB
-# IDIwMTACEzMAAAIG17xROJgj7CwAAQAAAgYwIgQgN630Ln7NScwgQs0FsN2szCRC
-# iqBorUIsWSgjg0foIUkwDQYJKoZIhvcNAQELBQAEggIAXHqparPuWdQuNkfmNFRl
-# RsyowOC+dQXL/QnpO1QFibCeNRkzqsRhgiMNz7aLzWC3iOOFO+Bf5NDBx/s5dMcg
-# WSq9iQYE0HA8fFchQ3XqETT99p9kG6i5e8NmitupmZsXKhX0osMDYAXMGwtqYHbl
-# 7bnSwJUDfZ0GZIVaV2RPoX8/mizuKmvSalCrmFwbcD1k9jqkSJyidKwaxtV/90ws
-# m6v5HTOBeUVQQ8LZx4HS4f/O7rl/Bh1EifRumwawvHz4swHkNVgZtM4mbq+qAQ8V
-# b47wVjbstyBB5cJbDDzMJv5nSJyN2Ow/CdPkRdbN8flsenH9sY9NHeir+H4f7N5a
-# 74jk2pTrh54zk3i/Esg2eeBz65uwN/qRiQKjbK4LGNWw7QUs1GTkoMqVmbetBPLw
-# XqIMQNyOP7fyyaCT5EoGD+ywyLuQ51lM8y98or6SPxsBVNf/Swm/XF5ktiS7x/W/
-# 9yB1od4ugifMr+k8OWsLIqPE7BZs3aWqGpXRRd5sXiBxiTJzvOfwns8ry6c163zu
-# DR+8qp3U2wpgsKUBoPzN+Qhp2YCJjPqSkHVNVxrUS1elSleKvYY6wuAdFrR1BhUN
-# hob1jWVGN5tuOmDUQe17RnK2KSrcmEnmuY/3jVLRlDkdVvRo58DASK0RVktaJo7m
-# CkYPF/nBf++Ik02nFPmY1uM=
+# IFBDQSAyMDEwMA0GCSqGSIb3DQEBCwUAAgUA63PzNTAiGA8yMDI1MDMwNjEwMTEw
+# MVoYDzIwMjUwMzA3MTAxMTAxWjBzMDkGCisGAQQBhFkKBAExKzApMAoCBQDrc/M1
+# AgEAMAYCAQACAS4wBwIBAAICEgkwCgIFAOt1RLUCAQAwNgYKKwYBBAGEWQoEAjEo
+# MCYwDAYKKwYBBAGEWQoDAqAKMAgCAQACAwehIKEKMAgCAQACAwGGoDANBgkqhkiG
+# 9w0BAQsFAAOCAQEAFlGeRlP6C8AHa2oNMbi0DIYVbCGN9wiBIwG9CreYRiRYcL3m
+# HniuUaRVpMwZUc1FpLqjPtPM9dBMvNIMx4CyTY0Fza5SPP6xCT8AC/vgtUy9A0D0
+# J8HaDBfhHGRh7napYFKPS9PyvBSzElzQVbgr07hWz+ag2XA898gHzu+42H5gnNnc
+# FyZtxDhd3Efdpd+WHNyenxK1Z5uElqNOG3/iMusKeHRnUOYi+pEhJRJNTtwGOHXo
+# nOK+jJrRd0/xeSfxTKWPQZkPHEaGmEtFejN4nKuxVYjpmnYyKypWPqRvOBSJc4M5
+# WMuI4dvaU4h+MkSsRpkxEo9G8J9kgyD4Ht/UZDGCBA0wggQJAgEBMIGTMHwxCzAJ
+# BgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25k
+# MR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1pY3Jv
+# c29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwAhMzAAACDizLKH2VIHVjAAEAAAIOMA0G
+# CWCGSAFlAwQCAQUAoIIBSjAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwLwYJ
+# KoZIhvcNAQkEMSIEIAByYoU/oWllMVkSQKg+XEA+ObUHjwXpvVw/VfvPM03jMIH6
+# BgsqhkiG9w0BCRACLzGB6jCB5zCB5DCBvQQgAXQdcyXw6YGQrbrubGhspKKHA50/
+# R5Q1dAzKk/NPEoYwgZgwgYCkfjB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
+# aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
+# cnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0EgMjAx
+# MAITMwAAAg4syyh9lSB1YwABAAACDjAiBCANcTlf253Dwgi5VYx5n09/oforQbQW
+# bP7L34csstCgoTANBgkqhkiG9w0BAQsFAASCAgB6fqC/BH3X6CB6UoTDYfNlMgZ0
+# XJH6++XWXsMNg+40Uw1M7quJ1FuPEtLW8TuFr99W/2Cr2YXsKDGX1uj0YMiNY4hN
+# khTaT0am6lV8ZkM5lTfJlyBleHMbCa78CgqaMvpVy8dzosbgfixyHxQLOcEr7k7k
+# yqeVyzKK6RykLXwC69BmsTwtLUQ0QdMKEwWpzHVuUNSk6GxlyyezyNUqOyZVhYdo
+# Sxm/WXdWNl8mVidep9Z7C19FgVP1QZ2/CCVoJ+hJnrrtsYIwDbyN5GKHitSGKBQ6
+# oVPEOmWFyRnVP7HcgayGSfghs6y8Xfl75OPN9zD4s9lGjAl2+OkKY+9SuOkuQ5dr
+# gyMobUwb9iRy2k3iUZLkqu8zR4ZJmH9t3tZ22xiyMjI5QMC9pQB16qpM3Or2FQam
+# /9v0T9kqMAhSQ/kjTnybjbjPyC8EE2Vq1WSJ1bJ/NHTfA777M+arzRjbsaFHvY9h
+# LntwMxFEs/ZcegOEmu24DP/8fitmkrs0pTtmZFuDP4ahtSLeGWxEdD408Z5CIDvr
+# KjpgmnJp8kaYoPEIeDdvobgd8J6KblgoUJPbSoqwr5QOPA01WrFJHM+nh/nd2m3q
+# AD3Tf7GeQevXIqBAftQI26xf8rcII8HMl5l4AWeO7ZHjz3LlK6s+z1AvDllK+ECE
+# aRrRBJNSw7PfVFhyjQ==
 # SIG # End signature block

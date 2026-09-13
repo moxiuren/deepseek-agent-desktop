@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.7 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.8 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -62,7 +62,7 @@
 文件内容
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
-NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long tasks use detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log, then poll with Get-Content -Tail.
+Start-Job works natively via host ThreadJob backend (same Job objects: Wait-Job/Receive-Job/Remove-Job all work). Prefer it for background work; local_cmd:async fence remains for the detached lane.
 ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (fence-line local_cmd:async). The command runs detached without blocking the queue; progress polls automatically; the final result returns to session. Quick commands stay sync.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
@@ -1109,7 +1109,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.7', cmd: normCmd.slice(0, 80) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.8', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1152,22 +1152,8 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         try { pendingDispatch.set(controller.cardId, { sig: 'cmd:' + normCmd, at: Date.now() }); } catch (_) {}
         try { lastDispatchAt = Date.now(); } catch (_) {}
 
-        // v4.3.5 Start-Job intercept (P2-b/P1-b): the hosted runspace cannot spawn
-        // pwsh.exe job hosts. Refuse with the working detached pattern instead of
-        // letting it fail with 3 cascading errors. Detached jobs also bypass the
-        // serial queue, partially mitigating long-task blocking.
-        if (/\bStart-Job\b/i.test(command)) {
-            const sjMsg = '[已拦截] Start-Job 在进程内 runspace 宿主下不可用（无 pwsh.exe 后台进程）。改用分离式异步：\n$log = "C:/Windows/TEMP/opencode/job-NAME.log"\nStart-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-Command","<你的命令> *>&1 | Out-File -Encoding utf8 $log"\necho "DETACHED:$log"\n然后轮询：Get-Content $log -Tail 20（日志出现即代表已在后台跑，不占执行通道）。';
-            try { controller.setStatus('已拦截：Start-Job 不可用', '#ef4444', false); } catch (_) {}
-            try { controller.setOutput(sjMsg, true); } catch (_) {}
-            try { updateHUD('Start-Job 已拦截，已给异步模板', '#ef4444'); } catch (_) {}
-            isExecutingNow = false;
-            // v4.3.6 refusal-feedback fix (P6): same as wildcard refusal — no result =
-            // model waits forever. Deliver the intercept as a normal (failed) result.
-            try { window.__agentBridge.onCommandResult({ id: controller.cardId, exitCode: 1, output: sjMsg, __verified: true }); } catch (_) {}
-            return;
-        }
-
+        // v4.3.8: Start-Job intercept REMOVED (P2-b now owned by host ThreadJob shim).
+        // Keeping the refusal would block the very shim it was bridging to.
         const outMsg = {
             action: "execute",
             command: command,

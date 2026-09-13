@@ -50,6 +50,9 @@ namespace DeepSeek
         // DSX cannot rebuild the host, so async execution must live here. ----
         private readonly ConcurrentDictionary<string, AsyncJobEntry> _asyncJobs = new();
         private static readonly TimeSpan AsyncJobMaxAge = TimeSpan.FromMinutes(30);
+        // Dispatch-received timestamps: lets FeedResultBackAsync log host-side latency
+        // (splits any feedback lag into host-ms vs bridge-ms definitively).
+        private readonly ConcurrentDictionary<string, long> _execStartMs = new();
         private long _lastDropTimestamp = 0;
         private long _lastInjectTicks = 0;
 
@@ -1054,6 +1057,12 @@ namespace DeepSeek
         private async Task ExecuteLocalCommandAsync(string id, string command)
         {
             // Scan discipline first: instant reject, never consumes queue slots.
+            try
+            {
+                _execStartMs[id] = Environment.TickCount64;
+                App.Log($"[Exec] id={id} cmdHead={command.Substring(0, Math.Min(300, command.Length))}");
+            }
+            catch { }
             string userProfileDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             string? disciplineMsg = CheckScanDiscipline(command, userProfileDir);
             if (disciplineMsg != null)
@@ -1352,7 +1361,7 @@ namespace DeepSeek
 
         private static string ThreadJobModuleDir()
         {
-            try { return Path.Combine(AppContext.BaseDirectory, "Modules", "ThreadJob"); }
+            try { return Path.Combine(AppContext.BaseDirectory, "Modules", "Microsoft.PowerShell.ThreadJob"); }
             catch { return ""; }
         }
 
@@ -1362,7 +1371,7 @@ namespace DeepSeek
         {
             try
             {
-                string psd1 = Path.Combine(ThreadJobModuleDir(), "ThreadJob.psd1");
+                string psd1 = Path.Combine(ThreadJobModuleDir(), "Microsoft.PowerShell.ThreadJob.psd1");
                 if (!File.Exists(psd1)) { App.Log("[Runspace] ThreadJob module not bundled, skipping compat"); return; }
                 Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
                 using (var ps = PowerShell.Create())
@@ -1400,6 +1409,27 @@ function global:Start-Job {
                     ps.Streams.ClearStreams();
                 }
                 App.Log("[Runspace] ThreadJob compat ready (Start-Job -> Start-ThreadJob)");
+                // Zero-probe self-test: proves the shim REALLY works in this trimmed runtime
+                // (gallery ThreadJob 2.1.0 was an empty rename-shell; this guards regressions).
+                try
+                {
+                    using var tst = PowerShell.Create();
+                    tst.Runspace = rs;
+                    tst.AddScript("$tj = Start-Job { 'THREADJOB-SELFTEST-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
+                    var tres = tst.Invoke();
+                    string joined = "";
+                    try { foreach (var o in tres) joined += (o?.ToString() ?? "") + "|"; } catch { }
+                    if (!tst.HadErrors && joined.Contains("THREADJOB-SELFTEST-OK"))
+                        App.Log("[Runspace] ThreadJob selftest: OK");
+                    else
+                    {
+                        string err = "";
+                        try { foreach (var e in tst.Streams.Error) err += e.ToString() + " // "; } catch { }
+                        App.Log($"[Runspace] ThreadJob selftest: FAIL out=[{joined}] err=[{err}]");
+                    }
+                    tst.Streams.ClearStreams();
+                }
+                catch (Exception ex) { App.Log($"[Runspace] ThreadJob selftest: EXCEPTION {ex.Message}"); }
             }
             catch (Exception ex) { App.Log($"[Runspace] ThreadJob compat unavailable: {ex.Message}"); }
         }
@@ -1434,6 +1464,7 @@ function global:Start-Job {
         {
             string jobId = "dsx-" + Guid.NewGuid().ToString("N").Substring(0, 8);
             var entry = new AsyncJobEntry { JobId = jobId };
+            try { _execStartMs[id] = Environment.TickCount64; } catch { }
             try
             {
                 entry.Rs = NewAgentRunspace();
@@ -1489,6 +1520,7 @@ function global:Start-Job {
 
         private async Task PollAsyncJobAsync(string id, string jobId)
         {
+            try { _execStartMs[id] = Environment.TickCount64; } catch { }
             if (!_asyncJobs.TryGetValue(jobId, out var entry))
             {
                 await FeedResultBackAsync(id, 1, $"[后台任务] job={jobId} 不存在（可能已完成并清理，或 app 重启后失效）。");
@@ -1568,6 +1600,11 @@ function global:Start-Job {
             bool asyncAck = false,
             bool jobDone = false)
         {
+            // Host-side latency stamp: definitive split of feedback lag (host-ms vs bridge-ms).
+            long execAt = 0;
+            try { if (_execStartMs.TryRemove(id, out var t0)) execAt = t0; } catch { }
+            long hostMs = execAt > 0 ? Environment.TickCount64 - execAt : -1;
+            try { App.Log($"[FeedResult] id={id} exit={exitCode} outLen={(output?.Length ?? 0)} hostMs={hostMs} job={jobId ?? "-"}"); } catch { }
             if (App.DirectSendEnabled)
             {
                 try
