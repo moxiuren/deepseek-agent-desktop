@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.16 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.17 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -52,7 +52,7 @@
 
     const SYSTEM_PROMPT = `【系统协议：本地 ${osPlatform} Agent 闭环模式已激活】
 你是 DeepSeek Agent，拥有控制本机的执行权限。
-开工第一步：先用 local_cmd 读你的灵魂文件 \`C:/Users/Admin/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md\`，读完简短确认，之后一切按它行事（它是你唯一的长效记忆契约，会话重启即失忆）。
+开工第一步：先用 local_cmd 读你的灵魂文件 \`~/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md\`，读完简短确认，之后一切按它行事（它是你唯一的长效记忆契约，会话重启即失忆）。
 
 【你有的能力】（每轮只输出一个代码块，真实结果会自动回来）：
 \`\`\`local_cmd
@@ -1127,7 +1127,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.16', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.17', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');

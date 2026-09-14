@@ -6,7 +6,7 @@
  */
 module.exports = {
   onLoad: function (ctx, meta) {
-    var TS_PATH = 'C:/Users/Admin/Documents/ObsidianVault/00-Dashboard/Task-State.md';
+    var TS_PATH = '~/Documents/ObsidianVault/00-Dashboard/Task-State.md';
     var POLL_MS = 8000;
     function sendInput(text) {
       try {

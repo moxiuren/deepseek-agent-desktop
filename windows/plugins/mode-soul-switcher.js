@@ -17,7 +17,8 @@ module.exports = {
     const isWindows = typeof navigator !== 'undefined' && 
       (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
     const osPlatform = isWindows ? "Windows (PowerShell)" : "macOS (Zsh)";
-    const SOUL_FILE_PATH = 'C:/Users/Admin/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md';
+    // 可移植默认：家目录相对路径（bridge read_file 原生展开 ~/）。按需改成你的 Vault 绝对路径。
+    const SOUL_FILE_PATH = '~/Documents/ObsidianVault/02-System-Rules/Agent-Soul.md';
 
     // 1. 底层通用通信与防御底座 (涵盖长文件生成器、防截断、宿主限制、搜索纪律)
     const BASE_PROTOCOL = `【系统协议：本地 ${osPlatform} Agent 闭环模式已激活】
@@ -75,7 +76,7 @@ NO Start-Job: Start-Job works natively via host ThreadJob backend (Wait-Job/Rece
     // 默认回退 Soul (从磁盘异步加载前使用)
     const DEFAULT_SOUL = `# Agent Soul — DeepSeek Agent（桌面端独立灵魂）
 - 你是 DeepSeek Agent，跑在用户本机 Windows 桌面客户端里，直连官网、无 API Key。
-- 长效记忆契约：Vault 根 C:/Users/Admin/Documents/ObsidianVault。开工读 00-Dashboard/Project-Index.md 与 00-Dashboard/Task-State.md；改完代码追加项目卡片与 Changelog-Stream.md。
+- 长效记忆契约：Vault 根 ~/Documents/ObsidianVault。开工读 00-Dashboard/Project-Index.md 与 00-Dashboard/Task-State.md；改完代码追加项目卡片与 Changelog-Stream.md。
 - 风格：高效干练、极客范；不说客套话，先穷尽本地手段查代码，带着方案汇报。
 - 红线：严禁 Emoji（统一中英文标签 [通过] / [警告] / [错误]）；严禁硬删文件（一律移入 .vault-trash）；严禁泄露 Token / 密码。`;
 

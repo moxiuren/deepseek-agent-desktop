@@ -3,7 +3,7 @@
 ; NOTE: run a fresh `dotnet publish ... -o ..\publish` first so ..\publish is current.
 
 #define MyAppName "DeepSeek Agent"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "moxiuren"
 #define MyAppExeName "DeepSeek.exe"
 #define SrcDir "..\publish"
@@ -18,7 +18,7 @@ DefaultDirName={localappdata}\DeepSeek-Agent
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\..\dist
-OutputBaseFilename=DeepSeek-Agent-Setup-1.0.6
+OutputBaseFilename=DeepSeek-Agent-Setup-1.0.7
 SetupIconFile=..\AppIcon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64

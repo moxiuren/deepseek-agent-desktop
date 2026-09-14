@@ -503,8 +503,8 @@ namespace DeepSeek
                 try { return File.ReadAllText(repoPath, Encoding.UTF8); } catch {}
             }
 
-            // 3. Try the standalone DSX repo (legacy dev layout)
-            string dsxPath = @"C:\Users\Admin\Documents\Projects\deepseek-agent-plugins\runtime\plugin-loader.js";
+            // 3. Try the standalone DSX repo (legacy dev layout, profile-relative = portable)
+            string dsxPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Documents", "Projects", "deepseek-agent-plugins", "runtime", "plugin-loader.js");
             if (File.Exists(dsxPath))
             {
                 try { return File.ReadAllText(dsxPath, Encoding.UTF8); } catch {}
@@ -2098,7 +2098,7 @@ function global:Start-Job {
 
         private void MenuAbout_Click(object sender, RoutedEventArgs e)
         {
-            MessageBox.Show("DeepSeek for Windows (Agent Closed-Loop Edition)\n版本: 1.0.0\n基于 .NET 8 + Microsoft Edge WebView2", "关于 DeepSeek", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show("DeepSeek for Windows (Agent Closed-Loop Edition)\n版本: 1.0.7\n基于 .NET 8 + Microsoft Edge WebView2", "关于 DeepSeek", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         private void MenuGitHub_Click(object sender, RoutedEventArgs e)
