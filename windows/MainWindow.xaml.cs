@@ -1547,7 +1547,7 @@ function global:Start-Job {
             }
             if (!entry.Done)
             {
-                await FeedResultBackAsync(id, 0, snapshot, jobId: jobId, jobRunning: true);
+                await FeedResultBackAsync(id, 0, snapshot, jobId: jobId, jobRunning: true, jobPoll: true);
                 return;
             }
             _asyncJobs.TryRemove(jobId, out _);
@@ -1598,7 +1598,8 @@ function global:Start-Job {
             string? jobId = null,
             bool jobRunning = false,
             bool asyncAck = false,
-            bool jobDone = false)
+            bool jobDone = false,
+            bool jobPoll = false)
         {
             // Host-side latency stamp: definitive split of feedback lag (host-ms vs bridge-ms).
             long execAt = 0;
@@ -1663,7 +1664,8 @@ function global:Start-Job {
                         jobId = jobId,
                         jobRunning = jobRunning,
                         asyncAck = asyncAck,
-                        jobDone = jobDone
+                        jobDone = jobDone,
+                        jobPoll = jobPoll
                     };
                     string jsonString = JsonSerializer.Serialize(payload);
                     string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({jsonString});";

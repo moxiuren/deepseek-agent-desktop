@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.12 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.13 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1112,7 +1112,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.12', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.13', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1644,6 +1644,8 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             } catch (e) { console.error('[Agent Bridge] onDirectReply error:', e); }
         },
         onCommandResult: function(data) {
+            // v4.3.13 entry marker: proves the result ENTERED the bridge (vs died in transit).
+            try { diagAttach({ phase: 'result-received', id: String((data && data.id) || ''), exit: (data && data.exitCode), job: String((data && data.jobId) || '-') }); } catch (_) {}
             isExecutingNow = false;
             isFeedbackPending = true; // Protect pacing countdown window from duplicate scans
             feedbackPendingStartedAt = Date.now();
@@ -1652,8 +1654,12 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             const exitCode = data.exitCode;
             // v4.3.7 async lane (P1-b): poll heartbeats update the card only; the final
             // jobDone result flows through the normal pipeline (pending kept until then).
+            // v4.3.13 poll recognition (P1-b final-loss root cause): host MUST flag polls,
+            // but recognize defensively too (jobRunning && !jobDone). Unflagged polls used to
+            // impersonate finals: consuming pend, queuing empty feedbacks, and getting the real
+            // final stale-dropped. Never again.
             const isAsyncAck = !!data.asyncAck;
-            const isJobPoll = !!data.jobPoll;
+            const isJobPoll = !!data.jobPoll || (data.jobRunning === true && data.jobDone !== true);
             if (data.jobId && data.jobDone) { try { if (jobPollTimers[cardId]) clearInterval(jobPollTimers[cardId]); } catch (_) {} try { delete jobPollTimers[cardId]; } catch (_) {} }
             if (isJobPoll && !data.jobDone) {
                 try { const cj = cardControllers[cardId]; if (cj) { cj.setStatus('后台运行中…', '#2563eb', true); cj.setOutput(String(data.output || ''), false); } } catch (_) {}
@@ -1732,6 +1738,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 }
             }
 
+            // v4.3.13: everything below is result-critical — any throw used to kill the
+            // result SILENTLY (no send, no verify, no log). Now it reports visibly.
+            try {
             const controller = cardControllers[cardId];
             const isSuccess = (exitCode === 0);
             const isFile = controller && (controller.isFile || controller.type === 'write_file');
@@ -1876,7 +1885,12 @@ ${output}
                 });
             }
 
+            try { diagAttach({ phase: 'result-queued', id: String(cardId) }); } catch (_) {}
             pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
+            } catch (err) {
+                try { diagAttach({ phase: 'result-crash', msg: String((err && err.message) || err).slice(0, 160) }); } catch (_) {}
+                try { updateHUD('结果处理异常，已记录', '#ef4444'); } catch (_) {}
+            }
         }
     };
     hideGlobal('__agentBridge');
