@@ -17,7 +17,7 @@ module.exports = {
     }
     /* ---------- DOM ---------- */
     var host = ctx.el('div',
-      'position:fixed;right:16px;top:72px;z-index:2147483645;' +
+      'position:fixed;right:20px;top:88px;z-index:2147483645;' +
       'font:12px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;' +
       'user-select:none;width:300px;max-width:92vw;', '');
     host.id = 'dsx-tsp-host';

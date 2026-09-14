@@ -210,6 +210,7 @@ ${soul}
       font-size: 12px;
       color: #1e293b;
       user-select: none;
+      white-space: nowrap;
     `, '');
     capsule.id = 'agent-mode-capsule';
 
