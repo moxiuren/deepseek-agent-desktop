@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.14 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.15 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -282,8 +282,6 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             user-select: none;
         `;
 
-        const isMac = navigator.platform?.toUpperCase().indexOf('MAC') >= 0 || navigator.userAgent?.indexOf('Macintosh') >= 0;
-        const shortcutKey = isMac ? "⌘I" : "Ctrl+I";
 
         hud.innerHTML = `
             <div style="display: flex; align-items: center; gap: 6px; font-weight: 600;">
@@ -291,16 +289,6 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 <span id="agent-hud-text" style="color: #0f172a;">Tool Call 引擎就绪</span>
             </div>
             <div style="width: 1px; height: 14px; background: #cbd5e1;"></div>
-            <button id="agent-inject-btn" style="
-                background: #2563eb;
-                color: #ffffff;
-                border: none;
-                border-radius: 12px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: 500;
-                cursor: pointer;
-            ">注入协议 (${shortcutKey})</button>
             <button id="agent-toggle-btn" style="
                 background: rgba(0,0,0,0.05);
                 color: #334155;
@@ -314,9 +302,6 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
 
         document.body.appendChild(hud);
 
-        document.getElementById('agent-inject-btn').addEventListener('click', () => {
-            injectPrompt(SYSTEM_PROMPT, true);
-        });
 
         const toggleBtn = document.getElementById('agent-toggle-btn');
         toggleBtn.addEventListener('click', () => {
@@ -1115,7 +1100,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.14', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.15', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');

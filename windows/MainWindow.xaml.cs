@@ -1774,7 +1774,7 @@ function global:Start-Job {
             "installed:!!window.__agentBridge," +
             "url:location.href," +
             "rs:document.readyState," +
-            "hudBtn:!!document.getElementById('agent-inject-btn')," +
+            "hudBtn:!!document.getElementById('agent-toggle-btn')," +
             "scan:((window.__agentBridge && window.__agentBridge._debug && window.__agentBridge._debug.describeScan) ? window.__agentBridge._debug.describeScan() : null)," +
             "dsx:(window.__DSX ? {ready:window.__DSX.__ready,plugins:window.__DSX.list(),errors:window.__DSX.errors()} : null)," +
             "textareas:[...document.querySelectorAll('textarea')].map(t=>({id:t.id,cls:String(t.className).slice(0,50),ph:t.placeholder,dis:t.disabled}))," +

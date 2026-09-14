@@ -1,4 +1,5 @@
-/* DSX 插件: mode-soul-switcher v1.0.1
+/* DSX 插件: mode-soul-switcher v1.0.2
+ * v1.0.2: 胶囊换 HUD 同款浅色玻璃挂件（与 bridge HUD 单视觉家族；bridge HUD 注入按钮退役，此胶囊为唯一协议入口）。
  * 职责:
  * 1. 提供 [标准模式] / [PTC批处理模式] / [规划模式] 三档切换胶囊;
  * 2. 提供 [Soul 灵魂] 查看与实时编辑悬浮弹窗;
@@ -189,42 +190,42 @@ ${soul}
       return true;
     }
 
-    /* ---------- DOM 构造: 悬浮模式胶囊 ---------- */
+    /* ---------- DOM 构造: 悬浮模式胶囊（v1.0.2：与 bridge HUD 同款浅色玻璃挂件，单视觉家族） ---------- */
     const capsule = ctx.el('div', `
       position: fixed;
-      top: 48px;
+      top: 50px;
       right: 20px;
       z-index: 2147483640;
       display: flex;
       align-items: center;
       gap: 6px;
-      background: rgba(17, 24, 39, 0.92);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border: 1px solid rgba(75, 85, 99, 0.4);
-      border-radius: 18px;
-      padding: 4px 10px;
-      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
-      font-size: 11px;
-      color: #e5e7eb;
+      background: rgba(255, 255, 255, 0.94);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(59, 130, 246, 0.35);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+      border-radius: 20px;
+      padding: 5px 12px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      color: #1e293b;
       user-select: none;
     `, '');
     capsule.id = 'agent-mode-capsule';
 
     const modeTag = ctx.el('span', `
-      color: #93c5fd;
+      color: #2563eb;
       font-weight: 700;
       letter-spacing: 0.5px;
     `, '模式:');
 
     // 模式选择下拉框
     const modeSelect = ctx.el('select', `
-      background: #1f2937;
-      color: #f3f4f6;
-      border: 1px solid #374151;
-      border-radius: 10px;
-      padding: 2px 6px;
+      background: #f1f5f9;
+      color: #1e293b;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 3px 6px;
       font-size: 11px;
       font-family: inherit;
       cursor: pointer;
@@ -258,28 +259,28 @@ ${soul}
 
     // 编辑 Soul 按钮
     const soulBtn = ctx.el('button', `
-      background: rgba(55, 65, 81, 0.6);
-      color: #d1d5db;
-      border: 1px solid #4b5563;
-      border-radius: 10px;
-      padding: 2px 8px;
+      background: rgba(0,0,0,0.05);
+      color: #334155;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 3px 8px;
       font-size: 11px;
       cursor: pointer;
       font-family: inherit;
       transition: all 0.15s;
     `, 'Soul 灵魂');
-    soulBtn.onmouseover = () => soulBtn.style.background = 'rgba(75, 85, 99, 0.8)';
-    soulBtn.onmouseout = () => soulBtn.style.background = 'rgba(55, 65, 81, 0.6)';
+    soulBtn.onmouseover = () => soulBtn.style.background = 'rgba(0,0,0,0.1)';
+    soulBtn.onmouseout = () => soulBtn.style.background = 'rgba(0,0,0,0.05)';
 
     // 一键注入当前模式按钮
     const injectBtn = ctx.el('button', `
       background: #2563eb;
       color: #ffffff;
       border: none;
-      border-radius: 10px;
-      padding: 3px 9px;
+      border-radius: 12px;
+      padding: 4px 10px;
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 500;
       cursor: pointer;
       font-family: inherit;
       box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
