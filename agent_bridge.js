@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.10 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.11 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1109,7 +1109,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.10', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.11', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -2098,6 +2098,10 @@ ${output}
         let clicks = 0;
         let tick = 0;
         let noTa = 0;
+        // v4.3.11: filled→emptied is the TRUE send signal. __lastCompletionAt is stamped
+        // at REQUEST time (api_sniff hook), so our own send always predates ack0 sampling
+        // and strict-ack can never pass — that caused 4 false red cards on 200-OK sends.
+        let seenFilled = false;
         const iv = setInterval(() => {
             tick++;
             let cur = 0;
@@ -2112,6 +2116,7 @@ ${output}
                     ours = !!(v && v.indexOf('[Tool Call') === 0);
                 }
             } catch (_) {}
+            if (ours) seenFilled = true;
             // v4.3.10 fail-fast: composer gone (crashed/navigating page) — don't hammer a corpse.
             if (taMissing) {
                 noTa++;
@@ -2122,7 +2127,7 @@ ${output}
                     return;
                 }
             } else { noTa = 0; }
-            if (cur > ack0 || (!strict && !ours)) {
+            if (cur > ack0 || (!ours && (!strict || seenFilled))) {
                 try { clearInterval(iv); } catch (_) {}
                 diagAttach({ phase: 'sent-ack', elapsed: Date.now() - t0, clicks: clicks });
                 try { done(true); } catch (_) {}
