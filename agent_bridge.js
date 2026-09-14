@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.11 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.12 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -100,6 +100,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     const streamBuf = {};
     // v4.3.7 async lane (P1-b): background job poll timers keyed by cardId.
     const jobPollTimers = {};
+    // v4.3.12 send-baseline: sampled at INJECT time (before our own send stamps the
+    // request-time ack). verify compares against this, not against a post-send sample.
+    let lastInjectAckBase = 0;
     function startJobPoll(cardId, jobId) {
         try { if (jobPollTimers[cardId]) clearInterval(jobPollTimers[cardId]); } catch (_) {}
         let n = 0;
@@ -1109,7 +1112,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.11', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.12', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -2092,8 +2095,10 @@ ${output}
     // v4.3.9 no-silent-loss: strict mode passes ONLY when a completion actually left
     // (the vacuous `!ours` pass could confirm a send that never filled the box).
     function verifySentOrRetry(done, strict) {
+        // v4.3.12: baseline = inject-time ack, so our own send (stamped later) advances it.
+        // (Sampling here would already include our send → strict could never pass.)
         let ack0 = 0;
-        try { ack0 = window.__lastCompletionAt || 0; } catch (_) {}
+        try { ack0 = (typeof lastInjectAckBase === 'number') ? lastInjectAckBase : (window.__lastCompletionAt || 0); } catch (_) {}
         const t0 = Date.now();
         let clicks = 0;
         let tick = 0;
@@ -2146,6 +2151,7 @@ ${output}
     }
 
     function injectPrompt(text, autoSend = false) {
+        try { lastInjectAckBase = window.__lastCompletionAt || 0; } catch (_) {}
         const textarea = findInputTextarea();
         if (!textarea) {
             console.error("[Agent Bridge] Textarea not found!");
