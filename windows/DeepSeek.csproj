@@ -24,6 +24,16 @@
     <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.*" />
   </ItemGroup>
 
+  <!-- Nested tool projects (bootstrapper) must NOT be compiled into the app:
+       SDK default globs would otherwise pull their sources AND generated obj/*.cs
+       into this compilation (duplicate assembly attributes). -->
+  <ItemGroup>
+    <Compile Remove="bootstrapper\**" />
+    <EmbeddedResource Remove="bootstrapper\**" />
+    <None Remove="bootstrapper\**" />
+    <Content Remove="bootstrapper\**" />
+  </ItemGroup>
+
   <!-- Embed and copy the shared agent_bridge.js from root -->
   <ItemGroup>
     <None Include="..\agent_bridge.js" Link="agent_bridge.js">
