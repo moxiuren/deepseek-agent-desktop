@@ -2103,7 +2103,7 @@ function global:Start-Job {
 
         private void MenuGitHub_Click(object sender, RoutedEventArgs e)
         {
-            Process.Start(new ProcessStartInfo("https://github.com/moxiuren/deepseek-mac") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo("https://github.com/moxiuren/deepseek-agent-desktop") { UseShellExecute = true });
         }
     }
 }

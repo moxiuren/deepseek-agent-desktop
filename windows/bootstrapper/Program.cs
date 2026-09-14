@@ -19,7 +19,7 @@ namespace DeepSeekBootstrap
         private const string AppVersion = "1.0.7";
         private const string AppTag = "v1.0.7";
         private const string AssetName = "DeepSeek-Agent-win-x64-trial-v1.0.7.zip";
-        private const string RepoSlug = "moxiuren/deepseek-mac";
+        private const string RepoSlug = "moxiuren/deepseek-agent-desktop";
         // ---- prereq sources (mirror windows/installer/DeepSeek-Agent.iss) ----
         private const string DotNetUrl = "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe";
         private const string WebView2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
