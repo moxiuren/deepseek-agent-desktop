@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.15 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.16 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -310,6 +310,33 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             toggleBtn.style.color = autoExecute ? "#334155" : "#ef4444";
             updateHUD(autoExecute ? "Tool Call 引擎就绪" : "已暂停自动执行", autoExecute ? "#10b981" : "#f59e0b");
         });
+    }
+
+    // v4.3.16 fallback inject: the overlay capsule is the primary protocol entry.
+    // The core keeps a self-healing fallback that exists ONLY while the capsule is
+    // absent (plugin failed to load / unloaded / removed). Either direction heals
+    // within one scan tick: capsule appears -> fallback removed; capsule gone -> fallback added.
+    // (New sessions also get the base protocol auto-injected — buttons are re-inject convenience.)
+    function reconcileInjectFallback() {
+        try {
+            if (!document.body) return;
+            const hasCapsule = !!document.getElementById('agent-mode-capsule');
+            let fb = document.getElementById('agent-inject-fallback-btn');
+            if (hasCapsule) {
+                if (fb && fb.parentNode) { try { fb.parentNode.removeChild(fb); } catch (_) {} }
+                return;
+            }
+            if (fb) return;
+            const hud = document.getElementById('deepseek-agent-hud');
+            if (!hud) return;
+            fb = document.createElement('button');
+            fb.id = 'agent-inject-fallback-btn';
+            fb.title = 'overlay 胶囊缺失时的核心兜底（注入基础协议）';
+            fb.style.cssText = 'background:#2563eb;color:#ffffff;border:none;border-radius:12px;padding:4px 10px;font-size:11px;font-weight:500;cursor:pointer;';
+            fb.textContent = '注入协议';
+            fb.addEventListener('click', () => { try { injectPrompt(SYSTEM_PROMPT, true); } catch (_) {} });
+            hud.appendChild(fb);
+        } catch (_) {}
     }
 
     function updateHUD(text, color) {
@@ -1100,7 +1127,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.15', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.16', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -2422,6 +2449,7 @@ ${output}
                 feedbackPendingStartedAt = 0;
             }
             createFloatingHUD();
+            reconcileInjectFallback();
             scanAndProcessToolCalls();
             collapseToolFeedbackBubbles();
         } catch (_) {}
