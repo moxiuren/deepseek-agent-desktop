@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.13 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.14 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -100,6 +100,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     const streamBuf = {};
     // v4.3.7 async lane (P1-b): background job poll timers keyed by cardId.
     const jobPollTimers = {};
+    // v4.3.14 A' overlay 插件 thin API: 规划模式机械 enforcement + 单一 prompt 源。
+    // local_cmd 文件意图不可解析——shell 侧仍靠提示词纪律；write_file 由机械层硬拒。
+    let planMode = false;
     // v4.3.12 send-baseline: sampled at INJECT time (before our own send stamps the
     // request-time ack). verify compares against this, not against a post-send sample.
     let lastInjectAckBase = 0;
@@ -1112,7 +1115,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.13', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.14', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1170,6 +1173,19 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     // 4b. Direct File Write via Native Host
     function executeFileWrite(path, content, controller) {
         if (isExecutingNow) return;
+
+        // v4.3.14 A' plan-mode mechanical enforcement: write_file fences refused even if
+        // the model emits one under planning prompt. Delivered as a normal failed result
+        // (v4.3.6 lesson: refusal without feedback wedges the loop).
+        if (planMode) {
+            const pmMsg = '[规划模式拦截] 当前为只读规划模式，write_file 已被机械层拒绝。如需写入请先切回标准/PTC 模式。';
+            try { controller.setStatus('规划模式：已拒绝写入', '#ef4444', false); } catch (_) {}
+            try { controller.setOutput(pmMsg, true); } catch (_) {}
+            try { updateHUD('规划模式拒写', '#ef4444'); } catch (_) {}
+            isExecutingNow = false;
+            try { window.__agentBridge.onCommandResult({ id: controller.cardId, exitCode: 1, output: pmMsg, __verified: true }); } catch (_) {}
+            return;
+        }
 
         const nowMs = Date.now();
         const sig = 'write_file:' + String(path || '').trim();
@@ -1583,6 +1599,18 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         },
         injectSystemPrompt: function() {
             injectPrompt(SYSTEM_PROMPT, true);
+        },
+        // v4.3.14 A': overlay 插件 thin API（机械层 + 单一源），UI 永不进核心。
+        setPlanMode: function(on) {
+            try {
+                planMode = !!on;
+                updateHUD(on ? '规划模式（只读）' : '标准执行模式', on ? '#f59e0b' : '#10b981');
+                try { diagAttach({ phase: 'plan-mode', on: planMode }); } catch (_) {}
+            } catch (_) {}
+            return planMode;
+        },
+        getSystemPrompt: function() {
+            try { return SYSTEM_PROMPT; } catch (_) { return ''; }
         },
         dumpConversation: function() {
             const out = [];

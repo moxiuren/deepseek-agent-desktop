@@ -1,10 +1,12 @@
-/* DSX 插件: mode-soul-switcher v1.0.0
+/* DSX 插件: mode-soul-switcher v1.0.1
  * 职责:
  * 1. 提供 [标准模式] / [PTC批处理模式] / [规划模式] 三档切换胶囊;
  * 2. 提供 [Soul 灵魂] 查看与实时编辑悬浮弹窗;
  * 3. 动态组装 [底层通信与防御底座] + [模式策略] + [实时 Soul] 并一键注入网页端;
  * 4. 支持快捷键 Ctrl+M (或 Cmd+M) 极速注入当前模式协议;
  * 5. 零侵入主仓库代码，基于 DSX PluginHost 独立热重载运行。
+ * v1.0.1 (review fixes): agent- 前缀自身 DOM 盾;Ctrl+M 输入框 guard;暂存诚实标签;
+ *   base 改从 bridge 取（防 fork 漂移）;规划模式接 bridge 机械 enforcement。
  * 遵循规范: 无任何 Unicode Emoji 表情符号，纯文本标签风格。
  */
 module.exports = {
@@ -28,7 +30,7 @@ module.exports = {
 文件内容
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
-NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long tasks use detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log, then poll with Get-Content -Tail.
+NO Start-Job: Start-Job works natively via host ThreadJob backend (Wait-Job/Receive-Job/Remove-Job all work). For detached background work you may also use local_cmd:async fence or detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log with Get-Content -Tail polling.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律四条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连；④Exit:1 且报错含 not recognized / Unexpected token / Missing expression → 说明命令被提取错了，换写法重发，严禁原样重发。
@@ -101,14 +103,25 @@ NO Start-Job: the hosted runspace cannot spawn pwsh.exe job hosts. For long task
       }
     }
 
-    // 初次加载时拉取一次真实 Soul
+    // 初次加载时拉取一次真实 Soul，并同步当前模式到 bridge 机械层
     loadSoulFromFile();
+    applyModeToBridge();
 
     // 组装最终完整的 Prompt
+    // v1.0.1: base 取自 bridge 单一源（防 fork 漂移），bridge 缺席时回退内嵌快照。
+    function getBaseProtocol() {
+      try {
+        if (window.__agentBridge && typeof window.__agentBridge.getSystemPrompt === 'function') {
+          const s = window.__agentBridge.getSystemPrompt();
+          if (s && s.length > 200) return s;
+        }
+      } catch (_) {}
+      return BASE_PROTOCOL;
+    }
     function buildComposedPrompt(modeKey, soulText) {
       const mode = MODES[modeKey] || MODES.standard;
       const soul = (soulText || cachedSoul).trim();
-      return `${BASE_PROTOCOL}
+      return `${getBaseProtocol()}
 
 ${mode.directive}
 
@@ -197,7 +210,7 @@ ${soul}
       color: #e5e7eb;
       user-select: none;
     `, '');
-    capsule.id = 'dsx-mode-capsule';
+    capsule.id = 'agent-mode-capsule';
 
     const modeTag = ctx.el('span', `
       color: #93c5fd;
@@ -226,9 +239,19 @@ ${soul}
       modeSelect.appendChild(opt);
     });
 
+    // v1.0.1: 规划模式机械 enforcement（bridge setPlanMode），提示词喊话之外再加一道真门。
+    // local_cmd 文件意图不可解析，shell 侧仍靠提示词纪律；write_file 由机械层硬拒。
+    function applyModeToBridge() {
+      try {
+        if (window.__agentBridge && typeof window.__agentBridge.setPlanMode === 'function') {
+          window.__agentBridge.setPlanMode(currentMode === 'plan');
+        }
+      } catch (_) {}
+    }
     modeSelect.addEventListener('change', function () {
       currentMode = modeSelect.value;
       ctx.store.set('selected_mode', currentMode);
+      applyModeToBridge();
       ctx.log('切换模式为: ' + MODES[currentMode].name);
       flashBadge(MODES[currentMode].tag);
     });
@@ -266,6 +289,7 @@ ${soul}
     injectBtn.onmouseout = () => injectBtn.style.background = '#2563eb';
 
     injectBtn.addEventListener('click', function () {
+      applyModeToBridge();
       const fullPrompt = buildComposedPrompt(currentMode, cachedSoul);
       injectToDeepSeek(fullPrompt, true);
       flashBadge('[已注入]');
@@ -296,6 +320,9 @@ ${soul}
       justify-content: center;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
     `, '');
+    // v1.0.1: agent- 前缀自身 DOM 盾——bridge 扫描器无条件跳过本插件全部节点
+    // （否则 Soul 预览 <pre> 里的围栏原文在空会话可被误执行）。
+    modalMask.id = 'agent-soul-modal';
 
     const modalBox = ctx.el('div', `
       background: #111827;
@@ -454,7 +481,7 @@ ${soul}
       font-size: 11px;
       font-weight: 500;
       cursor: pointer;
-    `, '保存到会话');
+    `, '暂存到会话');
 
     saveOnlyBtn.onclick = () => {
       cachedSoul = soulEditor.value;
@@ -473,11 +500,12 @@ ${soul}
       font-weight: 600;
       cursor: pointer;
       box-shadow: 0 2px 10px rgba(37, 99, 235, 0.4);
-    `, '保存并立即注入');
+    `, '暂存并立即注入');
 
     saveAndInjectBtn.onclick = () => {
       cachedSoul = soulEditor.value;
       ctx.store.set('cached_soul', cachedSoul);
+      applyModeToBridge();
       modalMask.style.display = 'none';
       const fullPrompt = buildComposedPrompt(currentMode, cachedSoul);
       injectToDeepSeek(fullPrompt, true);
@@ -506,8 +534,12 @@ ${soul}
     // 全局快捷键监听: Ctrl+M / Cmd+M 快速注入当前模式
     const offKey = ctx.on(window, 'keydown', function (e) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'm') {
+        // v1.0.1: 输入框有草稿（含自家 Soul 编辑框）时绝不覆盖——先发后注。
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) { flashBadge('[输入框忙]'); return; }
         e.preventDefault();
         e.stopPropagation();
+        applyModeToBridge();
         const fullPrompt = buildComposedPrompt(currentMode, cachedSoul);
         injectToDeepSeek(fullPrompt, true);
         flashBadge('[已注入]');
