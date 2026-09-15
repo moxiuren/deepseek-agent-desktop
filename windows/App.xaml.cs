@@ -166,8 +166,36 @@ namespace DeepSeek
             }
         }
 
+        public static void CleanupLegacyDesktopLogSafe()
+        {
+            try
+            {
+                string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string legacyLog = Path.Combine(desktopPath, "deepseek_debug.log");
+                if (File.Exists(legacyLog))
+                {
+                    var fi = new FileInfo(legacyLog);
+                    if (fi.Length > 0)
+                    {
+                        File.Delete(legacyLog);
+                        Log($"[Cleanup] Legacy desktop debug log cleaned: {legacyLog} ({fi.Length} bytes)");
+                    }
+                }
+            }
+            catch (IOException ioEx)
+            {
+                // 若被 VSCode/Notepad++ 占用，静默跳过，绝不阻断客户端正常启动
+                Trace.WriteLine($"[CleanupLegacyDesktopLogSafe Occupied]: {ioEx.Message}");
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[CleanupLegacyDesktopLogSafe Error]: {ex.Message}");
+            }
+        }
+
         protected override void OnStartup(StartupEventArgs e)
         {
+            CleanupLegacyDesktopLogSafe();
             Log("=== App.OnStartup enter ===");
 
             AppDomain.CurrentDomain.UnhandledException += (s, args) =>
