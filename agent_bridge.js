@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.26 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.27 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -231,15 +231,25 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             if (evalRes.remainingWaitMs <= 300) {
                 executeTask();
             } else {
+                // v4.3.27: the timer is AUTHORITATIVE. showPacing is display +
+                // manual override only -- previously a throttled slot waited
+                // forever for a button click ("auto" never fired), wedging the
+                // whole feedback chain with zero logs. Clicking now just fires
+                // early; double-fire is guarded.
+                let pacingFired = false;
+                let pacingTimer = null;
+                const firePacing = () => {
+                    if (pacingFired) return;
+                    pacingFired = true;
+                    try { clearTimeout(pacingTimer); } catch (_) {}
+                    executeTask();
+                };
                 const controller = context.cardId ? cardControllers[context.cardId] : null;
                 if (controller && typeof controller.showPacing === 'function') {
                     const countdownSec = Math.ceil(evalRes.remainingWaitMs / 1000);
-                    controller.showPacing(countdownSec, () => {
-                        executeTask();
-                    });
-                } else {
-                    setTimeout(executeTask, evalRes.remainingWaitMs);
+                    try { controller.showPacing(countdownSec, firePacing); } catch (_) {}
                 }
+                pacingTimer = setTimeout(firePacing, evalRes.remainingWaitMs);
             }
         }));
         return feedbackChain;
@@ -1264,7 +1274,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.26', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.27', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
