@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.27 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.28 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -921,6 +921,28 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         return m ? m[1].trim() : null;
     }
 
+    // v4.3.28 stop-probe: write-gate decision, extracted for tests.
+    // Fast lanes: request-settled (legacy 800ms) and network-confirmed end +
+    // 1.5s DOM quiet (~2s total). Slow lane: 10s absolute ceiling (P4 guard:
+    // mid-stream 1.8s fake quiets must never dispatch while a stream is in
+    // flight -- pending>0 holds the gate regardless of quiet time).
+    function writeGateDecision(now, lastChg, completedAfterChange) {
+        let endQuiet = false;
+        try {
+            const pend = (window.__completionPending | 0) || 0;
+            const endAt = window.__lastCompletionEndAt || 0;
+            endQuiet = pend === 0 && endAt > 0 && (now - endAt) < 15000 &&
+                       (now - lastChg) >= 1500 && endAt >= lastChg - 2000;
+        } catch (_) {}
+        if (endQuiet) {
+            return { threshold: 500, cause: 'stream-end', endQuiet: true };
+        }
+        if (completedAfterChange) {
+            return { threshold: 800, cause: 'stream-settled', endQuiet: false };
+        }
+        return { threshold: 10000, cause: 'quiet-10s', endQuiet: false };
+    }
+
     // 3. Scanner with Debounce & Quote Verification
     function scanAndProcessToolCalls() {
         if (isExecutingNow || isFeedbackPending) return;
@@ -1069,8 +1091,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             if (isFileWrite) {
                 const lastChg = (tracker && tracker.lastChange) || 0;
                 const completedAfterChange = (window.__lastCompletionAt || 0) > lastChg;
-                if (completedAfterChange) { debounceThreshold = 800; dispatchGateCause = 'stream-settled'; }
-                else { debounceThreshold = 10000; dispatchGateCause = 'quiet-10s'; }
+                const gate = writeGateDecision(now, lastChg, completedAfterChange);
+                debounceThreshold = gate.threshold;
+                dispatchGateCause = gate.cause;
             }
 
             if (now - tracker.lastChange < debounceThreshold) {
@@ -1274,7 +1297,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.27', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.28', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');

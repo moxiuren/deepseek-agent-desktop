@@ -82,8 +82,16 @@
     // Timestamp of the last chat-completion POST: the bridge uses it as
     // "previous send has left" to serialize feedback sends.
     window.__lastCompletionAt = 0;
+    // v4.3.28 stop-probe: exact completion-stream lifecycle. pending counts
+    // in-flight completion streams; lastCompletionEndAt stamps TRUE stream end
+    // (XHR load/error/abort). The bridge write-gate uses them to dispatch ~2s
+    // after output stops instead of waiting out the 10s quiet ceiling.
+    window.__completionPending = 0;
+    window.__lastCompletionEndAt = 0;
     hideGlobalSniff('__uploadState');
     hideGlobalSniff('__lastCompletionAt');
+    hideGlobalSniff('__completionPending');
+    hideGlobalSniff('__lastCompletionEndAt');
     function isUploadUrl(u) {
         try { return /\/api\/v0\/file\/upload_file/.test(String(u || '')); } catch (_) { return false; }
     }
@@ -129,6 +137,17 @@
             window.__uploadState.lastResAt = Date.now();
         } catch (_) {}
     }
+    function completionReq(url) {
+        if (!isCompletionUrl(url)) return;
+        try { window.__completionPending = (window.__completionPending | 0) + 1; } catch (_) {}
+    }
+    function completionRes(url, ended) {
+        if (!isCompletionUrl(url)) return;
+        try { if (window.__completionPending > 0) window.__completionPending--; } catch (_) {}
+        // Only XHR loadend marks true end (fetch settles at headers while the
+        // SSE body keeps streaming). ended=true comes from XHR finish() only.
+        if (ended) { try { window.__lastCompletionEndAt = Date.now(); } catch (_) {} }
+    }
 
     // --- stealth: Proxy wrappers pass BOTH `fn.toString()` and
     // `Function.prototype.toString.call(fn)` native-code checks, because the
@@ -158,6 +177,7 @@
                 if (isUploadUrl(url) && method === 'POST') uploadReq(url);
                 if (isCompletionUrl(url) && method === 'POST') {
                     try { window.__lastCompletionAt = Date.now(); } catch (_) {}
+                    try { completionReq(url); } catch (_) {}
                 }
                 if (!skipped) {
                     var body = (init && Object.prototype.hasOwnProperty.call(init, 'body')) ? init.body : undefined;
@@ -172,6 +192,7 @@
             } catch (_) {}
             return Reflect.apply(t, th, args).then(function(res) {
                 uploadRes(res.url);
+                try { completionRes(res.url || url, false); } catch (_) {}
                 if (isCompletionUrl(res.url)) {
                     try {
                         const c = res.clone();
@@ -205,6 +226,7 @@
                 return res;
             }, function(err) {
                 try { uploadRes(url); } catch (_) {}
+                try { completionRes(url, false); } catch (_) {}
                 throw err;
             });
         });
@@ -227,6 +249,7 @@
                 skipped = shouldSkip(th.__sniffUrl || '');
                 if (String(th.__sniffMethod || '').toUpperCase() === 'POST') {
                     uploadReq(th.__sniffUrl || '');
+                    try { completionReq(th.__sniffUrl || ''); } catch (_) {}
                     if (isCompletionUrl(th.__sniffUrl || '')) {
                         try { window.__lastCompletionAt = Date.now(); } catch (_) {}
                     }
@@ -234,6 +257,7 @@
                 var self = th;
                 var finish = function(emitRes) {
                     try { uploadRes(self.__sniffUrl || ''); } catch (_) {}
+                    try { completionRes(self.__sniffUrl || '', true); } catch (_) {}
                     if (!emitRes) return;
                     try {
                         var rec = { side: 'xhr-res', url: String(self.__sniffUrl || '').slice(0, 500), status: self.status };
