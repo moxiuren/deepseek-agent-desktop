@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.IO;
 using System.Text;
@@ -34,10 +35,27 @@ namespace DeepSeek
             var match = Regex.Match(output, @"\[\[AGENT_ATTACH_FILE:(.+?)\]\]");
             if (match.Success)
             {
-                string inner = match.Groups[1].Value;
-                string[] parts = inner.Split(new[] { ':' }, 2);
-                string filePath = Environment.ExpandEnvironmentVariables(parts[0].Trim());
-                string prompt = parts.Length > 1 ? parts[1].Trim() : "";
+                string inner = match.Groups[1].Value.Trim();
+                string filePath = inner;
+                string prompt = "";
+
+                int colonIdx = -1;
+                if (inner.Length > 2 && inner[1] == ':' && (inner[2] == '\\' || inner[2] == '/'))
+                {
+                    colonIdx = inner.IndexOf(':', 2);
+                }
+                else
+                {
+                    colonIdx = inner.IndexOf(':');
+                }
+
+                if (colonIdx >= 0)
+                {
+                    filePath = inner.Substring(0, colonIdx).Trim();
+                    prompt = inner.Substring(colonIdx + 1).Trim();
+                }
+
+                filePath = Environment.ExpandEnvironmentVariables(filePath);
 
                 if (File.Exists(filePath))
                 {
