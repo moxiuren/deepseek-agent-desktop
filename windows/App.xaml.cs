@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows;
 
@@ -68,25 +70,100 @@ namespace DeepSeek
             return false;
         }
 
+        private static readonly object _logLock = new object();
+        private const long MaxLogSizeBytes = 5 * 1024 * 1024; // 5 MB
+
+        // 静态单例路径定义，杜绝每次写入反复构建
+        private static readonly string LogDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DeepSeek-Agent", "logs");
+        private static readonly string LogFilePath = Path.Combine(LogDirectory, "deepseek.log");
+
+        private static long _approximateLogSizeBytes = -1; // 内存字节计数器
+        private static bool _directoryInitialized = false;
+
         public static void Log(string msg)
+        {
+            // 1. 静默降噪白名单：丢弃高频正常的 read_file 心跳
+            if (msg.StartsWith("[read_file] OK:") && msg.Contains("Task-State.md"))
+            {
+                return;
+            }
+
+            lock (_logLock)
+            {
+                try
+                {
+                    // 2. 目录单例初始化
+                    if (!_directoryInitialized)
+                    {
+                        if (!Directory.Exists(LogDirectory))
+                        {
+                            Directory.CreateDirectory(LogDirectory);
+                        }
+                        _directoryInitialized = true;
+                    }
+
+                    // 3. 内存字节计数初始化 (仅首次或重置时读取一次物理磁盘元数据)
+                    if (_approximateLogSizeBytes < 0)
+                    {
+                        _approximateLogSizeBytes = File.Exists(LogFilePath) ? new FileInfo(LogFilePath).Length : 0;
+                    }
+
+                    // 4. 轮转检查
+                    if (_approximateLogSizeBytes >= MaxLogSizeBytes)
+                    {
+                        RotateLogsSafe();
+                    }
+
+                    // 5. 格式化并落盘
+                    string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}\r\n";
+                    File.AppendAllText(LogFilePath, line);
+                    _approximateLogSizeBytes += Encoding.UTF8.GetByteCount(line);
+                }
+                catch (IOException ioEx)
+                {
+                    // 文件被外部占用或杀软锁定时降级，防止主进程闪退
+                    Trace.WriteLine($"[App.Log IOException - File Locked]: {ioEx.Message}");
+                    _approximateLogSizeBytes = -1; // 下次写入时校准
+                }
+                catch (Exception ex)
+                {
+                    Trace.WriteLine($"[App.Log Unexpected]: {ex.Message}");
+                }
+            }
+        }
+
+        private static void RotateLogsSafe()
         {
             try
             {
-                string logPath;
-                if (DiagnosticsEnabled)
+                string backup2 = Path.Combine(LogDirectory, "deepseek.log.2");
+                string backup1 = Path.Combine(LogDirectory, "deepseek.log.1");
+
+                if (File.Exists(backup2))
                 {
-                    logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "deepseek_debug.log");
+                    File.Delete(backup2);
                 }
-                else
+                if (File.Exists(backup1))
                 {
-                    logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                        "DeepSeek-Agent", "logs", "deepseek.log");
-                    string? dir = Path.GetDirectoryName(logPath);
-                    if (dir != null) Directory.CreateDirectory(dir);
+                    File.Move(backup1, backup2);
                 }
-                File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}\r\n");
+                if (File.Exists(LogFilePath))
+                {
+                    File.Move(LogFilePath, backup1);
+                }
+                _approximateLogSizeBytes = 0;
             }
-            catch {}
+            catch (IOException ioEx)
+            {
+                // 发生占用时放弃轮转重命名，直接保持追加写入，绝不崩溃
+                Trace.WriteLine($"[RotateLogsSafe In-Use Warning]: {ioEx.Message}");
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[RotateLogsSafe Error]: {ex.Message}");
+            }
         }
 
         protected override void OnStartup(StartupEventArgs e)
