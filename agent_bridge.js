@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.23 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.24 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1248,7 +1248,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.23', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.24', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1365,6 +1365,8 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     // v4.3.21: fail-closed root decision for feedback folding. Collapse ONLY
     // roots that are positively user-side; assistant-side roots (or anything
     // ambiguous) are left alone -- folding is cosmetic, over-folding is not.
+    // v4.3.24: d29f3d7d confirmed live on user roots 2026-09-16 (stable across
+    // site deploys); true root is nearest ds-message (probe fold-dbg).
     function isCollapsibleFeedbackRoot(root) {
         try {
             let cn = '';
@@ -1381,35 +1383,6 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         } catch (_) { return false; }
     }
 
-    // v4.3.23: deep probe -- 8 levels with role/data attrs, plus log-only
-    // sampling of bare-prefix quoters (assistant messages quoting tool text).
-    const foldDebugLogged = new WeakSet();
-    function foldDbg(root, why) {
-        try {
-            if (!root || foldDebugLogged.has(root)) return;
-            foldDebugLogged.add(root);
-            const chain = [];
-            let el = root, n = 0;
-            while (el && el !== document.body && n < 8) {
-                let c = '';
-                try { c = String(el.className || '').slice(0, 80); } catch (_) {}
-                let extra = '';
-                try {
-                    const g = (a) => (el.getAttribute ? (el.getAttribute(a) || '') : '');
-                    const bits = [];
-                    const rl = g('role'); if (rl) bits.push('role=' + rl);
-                    const dm = g('data-message-id'); if (dm) bits.push('mid=' + dm.slice(0, 8));
-                    const dr = g('data-role'); if (dr) bits.push('drole=' + dr);
-                    const al = g('aria-label'); if (al) bits.push('aria=' + al.slice(0, 24));
-                    if (bits.length) extra = '[' + bits.join(',') + ']';
-                } catch (_) {}
-                chain.push(el.tagName + extra + '|' + c);
-                el = el.parentElement; n++;
-            }
-            diagAttach({ phase: 'fold-dbg', why: why, chain: chain.join(' > ').slice(0, 600) });
-        } catch (_) {}
-    }
-
     function collapseToolFeedbackBubbles() {
         // The MutationObserver now watches `document`, so this can fire before <body> exists
         // (WebView2 runs the script at document-creation). createTreeWalker requires a Node.
@@ -1417,19 +1390,11 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         let node;
         const textNodes = [];
-        const quoteNodes = [];
         while (node = walker.nextNode()) {
             const v = (node.nodeValue || '').trim();
             if (isFeedbackTriggerText(v)) {
                 textNodes.push(node);
-            } else if (v.startsWith('[Tool Call')) {
-                // v4.3.23: log-only sample of quoters (assistant side quoting
-                // tool text) -- never folded, only reported for allowlisting.
-                quoteNodes.push(node);
             }
-        }
-        for (let qn of quoteNodes) {
-            try { foldDbg(qn.parentElement, 'quoter'); } catch (_) {}
         }
 
         for (let tn of textNodes) {
@@ -1450,12 +1415,12 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 try { rrole = container.getAttribute ? (container.getAttribute('role') || '') : ''; } catch (_) {}
                 let rmid = false;
                 try { rmid = !!(container.hasAttribute && container.hasAttribute('data-message-id')); } catch (_) {}
-                if (/\bchat-item\b|\bmessage-item\b/.test(rcn) || rrole === 'article' || rmid) break;
+                if (/\bchat-item\b|\bmessage-item\b|\bds-message\b/.test(rcn) || rrole === 'article' || rmid) break;
                 container = container.parentElement;
             }
-            if (!container || container === document.body) { foldDbg(tn.parentElement, 'no-root'); continue; }
+            if (!container || container === document.body) continue;
             if (collapsedBubblesSet.has(container)) continue;
-            if (!isCollapsibleFeedbackRoot(container)) { foldDbg(container, 'fail-closed'); continue; }
+            if (!isCollapsibleFeedbackRoot(container)) continue;
 
             {
                     collapsedBubblesSet.add(container);
