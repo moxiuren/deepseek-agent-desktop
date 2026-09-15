@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.17 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.18 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -929,9 +929,13 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             // Never treat our own feedback bubbles as fresh calls: they quote
             // previous output AND contain the local_cmd keyword in instructions,
             // which would otherwise re-execute old results in a loop.
+            // v4.3.18 P0: NEVER skip on the bare marker -- commands that merely
+            // mention it (e.g. isToolReturn判据) are valid. Only skip when the
+            // full feedback signature is present inside our own card context.
             try {
                 const scopeText = parent.innerText || parent.textContent || '';
-                if (scopeText.includes('[Tool Call')) continue;
+                const inOwnCard = !!(el.closest && el.closest('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill'));
+                if (scopeText.includes('[Tool Call Result (Exit:') && (inOwnCard || /若需继续执行|local_cmd\s*代码块/.test(scopeText))) continue;
             } catch (_) {}
 
             if (scanScope && !scanScope.contains(parent)) continue;
@@ -1123,9 +1127,17 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             }
 
             const scopeText = (scanScope.innerText || scanScope.textContent || '');
-            if (!scopeText.includes('[Tool Call')) {
-                const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
-                const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*?)\r?\n\s*```/i;
+            // v4.3.18 P0: same narrowing as the block-scan guard -- a command
+            // mentioning the marker must still reach the fallback. Only real
+            // feedback bubbles (Exit signature + follow-up instruction) skip it.
+            const scopeHasFeedback = scopeText.includes('[Tool Call Result (Exit:') && /若需继续执行|local_cmd\s*代码块/.test(scopeText);
+            if (!scopeHasFeedback) {
+                // v4.3.18 P1: body is GREEDY to the LAST closing fence so inner
+                // fences (e.g. here-strings writing markdown) no longer truncate
+                // the command. Fallback handles one streaming command per scope;
+                // multi-block messages go through the DOM block path above.
+                const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*)\r?\n\s*```/i;
+                const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*)\r?\n\s*```/i;
 
                 const writeMatch = scopeText.match(writeFenceRe);
                 const cmdMatch = !writeMatch ? scopeText.match(cmdFenceRe) : null;
@@ -1227,7 +1239,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.17', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.18', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
