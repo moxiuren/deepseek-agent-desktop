@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.22 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.23 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1248,7 +1248,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.22', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.23', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1381,8 +1381,8 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         } catch (_) { return false; }
     }
 
-    // v4.3.22: one-shot fold probe -- reports the real message-root classes
-    // into the native log so the collapse allowlist can be corrected.
+    // v4.3.23: deep probe -- 8 levels with role/data attrs, plus log-only
+    // sampling of bare-prefix quoters (assistant messages quoting tool text).
     const foldDebugLogged = new WeakSet();
     function foldDbg(root, why) {
         try {
@@ -1390,13 +1390,23 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             foldDebugLogged.add(root);
             const chain = [];
             let el = root, n = 0;
-            while (el && el !== document.body && n < 4) {
+            while (el && el !== document.body && n < 8) {
                 let c = '';
-                try { c = String(el.className || '').slice(0, 100); } catch (_) {}
-                chain.push(el.tagName + '|' + c);
+                try { c = String(el.className || '').slice(0, 80); } catch (_) {}
+                let extra = '';
+                try {
+                    const g = (a) => (el.getAttribute ? (el.getAttribute(a) || '') : '');
+                    const bits = [];
+                    const rl = g('role'); if (rl) bits.push('role=' + rl);
+                    const dm = g('data-message-id'); if (dm) bits.push('mid=' + dm.slice(0, 8));
+                    const dr = g('data-role'); if (dr) bits.push('drole=' + dr);
+                    const al = g('aria-label'); if (al) bits.push('aria=' + al.slice(0, 24));
+                    if (bits.length) extra = '[' + bits.join(',') + ']';
+                } catch (_) {}
+                chain.push(el.tagName + extra + '|' + c);
                 el = el.parentElement; n++;
             }
-            diagAttach({ phase: 'fold-dbg', why: why, chain: chain.join(' > ').slice(0, 400) });
+            diagAttach({ phase: 'fold-dbg', why: why, chain: chain.join(' > ').slice(0, 600) });
         } catch (_) {}
     }
 
@@ -1407,11 +1417,19 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         let node;
         const textNodes = [];
+        const quoteNodes = [];
         while (node = walker.nextNode()) {
             const v = (node.nodeValue || '').trim();
             if (isFeedbackTriggerText(v)) {
                 textNodes.push(node);
+            } else if (v.startsWith('[Tool Call')) {
+                // v4.3.23: log-only sample of quoters (assistant side quoting
+                // tool text) -- never folded, only reported for allowlisting.
+                quoteNodes.push(node);
             }
+        }
+        for (let qn of quoteNodes) {
+            try { foldDbg(qn.parentElement, 'quoter'); } catch (_) {}
         }
 
         for (let tn of textNodes) {
