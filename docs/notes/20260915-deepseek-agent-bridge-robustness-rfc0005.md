@@ -17,6 +17,7 @@ version: "1.0.9"
 base_sha: "73fe6cb512e022f1c841e17417e4e1a06a2e8870"
 merge_commit: "6fb21a9"
 changelog_commit: "1a1ed13"
+release_commit: "048b83a"
 ---
 
 # RFC-0005 Agent Bridge 健壮性与响应延迟修复
@@ -73,6 +74,7 @@ changelog_commit: "1a1ed13"
 - `b3c274e`: gatekeeper: add independent verification suite for RFC-0005
 - `6fb21a9`: merge: merge feature/rfc-0005 (Gate 2 Approved)
 - `1a1ed13`: docs(changelog): update CHANGELOG.md for v1.0.9 (RFC-0005)
+- `048b83a`: chore(release): bump version to 1.0.9 and align verification scripts
 
 ---
 
