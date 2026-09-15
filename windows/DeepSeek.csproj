@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -8,7 +8,7 @@
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <AssemblyName>DeepSeek</AssemblyName>
     <RootNamespace>DeepSeek</RootNamespace>
-    <Version>1.0.7</Version>
+    <Version>1.0.8</Version>
     <Authors>moxiuren</Authors>
     <Product>DeepSeek for Windows</Product>
     <Description>Native Windows desktop client for DeepSeek with autonomous local Agent closed-loop execution</Description>
