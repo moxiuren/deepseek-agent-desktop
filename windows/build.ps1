@@ -21,8 +21,14 @@ if (-not $TestOnly) {
     dotnet restore DeepSeek.csproj
 
     Write-Host "[2/3] Building and publishing..." -ForegroundColor Yellow
-    # 注意：禁止 PublishSingleFile（PowerShell SDK 单文件下 Assembly.Location 为空会崩，见 csproj 注释）
     dotnet publish DeepSeek.csproj -c Release -r win-x64 --self-contained false -o publish
+
+    $rootBridge = Join-Path (Split-Path $ScriptDir -Parent) "agent_bridge.js"
+    $targetBridge = Join-Path $ScriptDir "publish\agent_bridge.js"
+    if (Test-Path $rootBridge) {
+        Copy-Item -Path $rootBridge -Destination $targetBridge -Force
+        Write-Host "[Sync] Synced root agent_bridge.js to publish directory" -ForegroundColor Green
+    }
 
     Write-Host "[3/3] Build completed successfully!" -ForegroundColor Green
     Write-Host "Executable generated at: $ScriptDir\publish\DeepSeek.exe" -ForegroundColor Green
