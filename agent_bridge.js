@@ -1,6 +1,6 @@
 (function() {
     // Re-entry guard via the functional export (no extra marker global).
-    if (window.__agentBridge) return;
+    if (typeof window !== 'undefined' && window.__agentBridge) return;
     // Defence-in-depth: any unexpected init failure must be LOUD, never silently leave the
     // native side calling into an undefined window.__agentBridge.
     try {
@@ -83,21 +83,103 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     let feedbackChain = Promise.resolve();
     let prevSendAt = 0;
     let prevAcked = true;
-    // Send throttling + rate-limit backoff: the site rejects burst sends
-    // ("Messages too frequent"), which wedges the loop (request leaves but
-    // the message is refused). Floor the send rate, detect refusal, cool
-    // down, then retry once automatically.
-    const MIN_SEND_GAP_MS = 8000;
     const BACKOFF_MS = 90000;
     let lastAutoSendAt = 0;
     let rateLimitBackoffUntil = 0;
     let lastRateLimitHandledAt = 0;
     let lastFeedbackForRetry = { text: '', at: 0 };
     let backoffRetried = false;
+
+    // 统一权威单点动态节流引擎 (RFC-0005 Section 8.3)
+    const DynamicThrottle = {
+        BASE_GAP_TEXT_MS: 1500,
+        BASE_GAP_ATTACH_MS: 1500,
+        FLOOR_GAP_TEXT_MS: 200,
+        WINDOW_MS: 10000,
+        recentSends: [],         // 记录单调时钟时间戳
+        lastSendMono: 0,         // 上次发送确认的 performance.now()
+
+        clean(nowMono) {
+            const boundary = nowMono - this.WINDOW_MS;
+            this.recentSends = this.recentSends.filter(t => t > boundary);
+        },
+
+        // 仅在真实发送成功上屏时提交，重试严禁触发
+        recordSendCommit(nowMono) {
+            const t = nowMono || performance.now();
+            this.lastSendMono = t;
+            this.recentSends.push(t);
+            this.clean(t);
+        },
+
+        // 接收 DirectSend 同步
+        syncDirectSendSuccess() {
+            this.recordSendCommit(performance.now());
+        },
+
+        evaluate(context) {
+            const nowMono = performance.now();
+            this.clean(nowMono);
+
+            // 冷启动首发保护穿透防御
+            if (this.lastSendMono === 0) {
+                return { remainingWaitMs: 0, targetGap: 0, burstCount: 0 };
+            }
+
+            const burstCount = this.recentSends.length;
+            let burstPenalty = 0;
+            if (burstCount >= 3) {
+                burstPenalty = 2500;
+            } else if (burstCount >= 2) {
+                burstPenalty = 1000;
+            }
+
+            const isAttachment = !!(context && context.isAttachment);
+            const baseGap = isAttachment ? this.BASE_GAP_ATTACH_MS : this.BASE_GAP_TEXT_MS;
+            const targetGap = Math.max(isAttachment ? baseGap : this.FLOOR_GAP_TEXT_MS, baseGap + burstPenalty);
+
+            // 真实单调时钟自然流逝
+            const naturalElapsed = Math.max(0, nowMono - this.lastSendMono);
+            // 宿主执行耗时冲抵 (防御负数)
+            const hostOffset = Math.max(0, (context && context.hostMs) || 0);
+            const totalEffectiveElapsed = naturalElapsed + hostOffset;
+
+            let remainingWaitMs = Math.max(0, targetGap - totalEffectiveElapsed);
+
+            // 限流退避兜底
+            if (typeof rateLimitBackoffUntil !== 'undefined' && rateLimitBackoffUntil > 0) {
+                const backoffRem = Math.max(0, rateLimitBackoffUntil - Date.now());
+                if (backoffRem > remainingWaitMs) {
+                    remainingWaitMs = backoffRem;
+                }
+            }
+
+            return {
+                remainingWaitMs: Math.round(remainingWaitMs),
+                targetGap,
+                burstCount
+            };
+        }
+    };
+
     // v4.3.4 receipt integrity (P1.3): dispatch→result correlation + stream accumulation.
     const pendingDispatch = new Map();
     let lastDispatchAt = 0;
     const streamBuf = {};
+    const streamBufTime = {};
+    // RFC-0005 9.3: 全局 60s 惰性清理轮询器，回收超过 120s 未被消费的残余缓冲区
+    setInterval(() => {
+        try {
+            const now = Date.now();
+            for (const cid in streamBufTime) {
+                if (now - streamBufTime[cid] > 120000) {
+                    delete streamBuf[cid];
+                    delete streamBufTime[cid];
+                }
+            }
+        } catch (_) {}
+    }, 60000);
+
     // v4.3.7 async lane (P1-b): background job poll timers keyed by cardId.
     const jobPollTimers = {};
     // v4.3.14 A' overlay 插件 thin API: 规划模式机械 enforcement + 单一 prompt 源。
@@ -119,28 +201,46 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             try { sendToNative({ action: 'job_poll', jobId: jobId, id: cardId }); } catch (_) {}
         }, 3000);
     }
-    function queueFeedbackSlot(fn) {
-        feedbackChain = feedbackChain.then(() => new Promise(resolve => {
-            const start = Date.now();
-            const iv = setInterval(() => {
-                let proceed = false;
-                try {
-                    const lastAck = window.__lastCompletionAt || 0;
-                    const gapOk = Date.now() - lastAutoSendAt >= MIN_SEND_GAP_MS;
-                    const coolOk = Date.now() >= rateLimitBackoffUntil;
-                    if (prevAcked && gapOk && coolOk) proceed = true;
-                    else if (!prevAcked && prevSendAt > 0 && lastAck >= prevSendAt && gapOk && coolOk) proceed = true;
-                    else if (Date.now() - start > 30000) proceed = true;
-                } catch (_) { proceed = true; }
-                if (proceed) {
-                    clearInterval(iv);
-                    prevSendAt = Date.now();
-                    prevAcked = false;
-                    try { window.__lastSendAt = prevSendAt; hideGlobal('__lastSendAt'); } catch (_) {}
-                    try { fn((acked) => { prevAcked = !!acked; resolve(); }); }
-                    catch (_) { prevAcked = true; resolve(); }
+
+    // 队列锁彻底替换原 agent_bridge.js 逻辑 (RFC-0005 Section 8.3)
+    function queueFeedbackSlot(contextOrFn, maybeTaskFn) {
+        const context = (typeof contextOrFn === 'function') ? {} : (contextOrFn || {});
+        const taskFn = (typeof contextOrFn === 'function') ? contextOrFn : maybeTaskFn;
+
+        feedbackChain = feedbackChain.then(() => new Promise((resolve) => {
+            const evalRes = DynamicThrottle.evaluate(context);
+
+            const executeTask = () => {
+                const controller = context.cardId ? cardControllers[context.cardId] : null;
+                if (controller && typeof controller.hidePacing === 'function') {
+                    try { controller.hidePacing(); } catch (_) {}
                 }
-            }, 200);
+                try {
+                    taskFn((success) => {
+                        if (success) {
+                            DynamicThrottle.recordSendCommit();
+                        }
+                        resolve();
+                    });
+                } catch (err) {
+                    console.error("[Agent Bridge] Task execution failed:", err);
+                    resolve();
+                }
+            };
+
+            if (evalRes.remainingWaitMs <= 300) {
+                executeTask();
+            } else {
+                const controller = context.cardId ? cardControllers[context.cardId] : null;
+                if (controller && typeof controller.showPacing === 'function') {
+                    const countdownSec = Math.ceil(evalRes.remainingWaitMs / 1000);
+                    controller.showPacing(countdownSec, () => {
+                        executeTask();
+                    });
+                } else {
+                    setTimeout(executeTask, evalRes.remainingWaitMs);
+                }
+            }
         }));
         return feedbackChain;
     }
@@ -637,7 +737,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 <span style="color: #64748b; font-style: italic;">[${isFile ? '等待文件写入完成...' : '等待终端执行输出...'}]</span>
             </div>
             <div id="${cardId}-pacing-bar" style="display: none; padding: 6px 14px; background: #f0fdf4; border-top: 1px solid #bbf7d0; font-size: 11px; color: #15803d; align-items: center; justify-content: space-between;">
-                <span id="${cardId}-pacing-text">⏱ 防频控保护：将在 3 秒后自动同步给 DeepSeek...</span>
+                <span id="${cardId}-pacing-text">⏱ 防频控保护：正在准备同步给 DeepSeek...</span>
                 <button id="${cardId}-send-now-btn" style="background: #16a34a; color: #fff; border: none; border-radius: 6px; padding: 2px 8px; font-size: 10px; cursor: pointer;">立即发送</button>
             </div>
         `;
@@ -1480,42 +1580,40 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         } catch (_) {}
     }
 
-    // Helper: Wait until DeepSeek web finishes uploading attachment to server.
-    // Fires ASAP once triple-signal holds (with 800ms dwell covering the upload tail),
-    // 8s timeout fallback still sends to never wedge the loop.
-    function waitForAttachmentReady(callback, maxWaitMs = 8000) {
-        const startTime = Date.now();
+    // Helper: Wait until DeepSeek web finishes uploading attachment to server (RFC-0005 Section 8.4).
+    // 规范签名，接收元数据与回调，动态计算 3~10s 超时，参数对象化返回 { ok, timedOut, elapsed }
+    function waitForAttachmentReady(metaOrCallback, maybeCallback) {
+        const meta = (typeof metaOrCallback === 'function') ? {} : (metaOrCallback || {});
+        const callback = (typeof metaOrCallback === 'function') ? metaOrCallback : maybeCallback;
+        const startTime = performance.now();
+        const fileSize = meta && meta.size ? meta.size : 0;
+        // 依据文件大小动态计算超时，最低 3s，最高 10s
+        const maxWaitMs = Math.min(10000, Math.max(3000, Math.ceil(fileSize / 150000) * 1000));
         let readySince = 0;
-        let ticks = 0;
+
         const timer = setInterval(() => {
-            const now = Date.now();
-            ticks++;
+            const now = performance.now();
             const st = probeAttachmentState();
-            // Log signal states ~1/sec for diagnosis (native writes to local log)
-            if (ticks % 7 === 1) {
-                diagAttach({ phase: 'wait', elapsed: now - startTime, loading: st.loading,
-                             chip: st.chip, btnFound: st.btnFound, btnDisabled: st.btnDisabled,
-                             pending: st.pending, uploadSeen: !!st.uploadSeen });
-            }
+
             if (st.ready) {
                 if (!readySince) readySince = now;
-                if (now - readySince >= 800 || now - startTime > maxWaitMs) {
+                if (now - readySince >= 400 || (now - startTime) > maxWaitMs) {
                     clearInterval(timer);
-                    let collapsed = 0;
-                    try { collapsed = window.__collapsedBubbles || 0; } catch (_) {}
-                    diagAttach({ phase: 'fire', elapsed: now - startTime, dwell: now - readySince, collapsed: collapsed });
-                    callback();
+                    if (typeof callback === 'function') {
+                        callback({ ok: true, timedOut: false, elapsed: Math.round(now - startTime) });
+                    }
                 }
                 return;
             }
+
             readySince = 0;
-            if (now - startTime > maxWaitMs) {
+            if ((now - startTime) > maxWaitMs) {
                 clearInterval(timer);
-                diagAttach({ phase: 'timeout', elapsed: now - startTime, loading: st.loading,
-                             chip: st.chip, btnFound: st.btnFound, btnDisabled: st.btnDisabled,
-                             pending: st.pending, uploadSeen: !!st.uploadSeen });
-                try { console.warn("[Agent Bridge] Attachment wait timed out, sending anyway"); } catch (_) {}
-                callback();
+                diagAttach({ phase: 'timeout', elapsed: Math.round(now - startTime), name: meta.filename || '' });
+                console.warn("[Agent Bridge] Attachment wait timed out, falling back to text prompt");
+                if (typeof callback === 'function') {
+                    callback({ ok: false, timedOut: true, elapsed: Math.round(now - startTime) });
+                }
             }
         }, 150);
     }
@@ -1569,6 +1667,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 };
             }
         },
+        DynamicThrottle: DynamicThrottle,
         onFileReadResult: function(data) {
             try {
                 const reqId = data && data.reqId;
@@ -1642,15 +1741,25 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             try {
                 if (data && data.id && typeof data.chunk === 'string') {
                     streamBuf[data.id] = String(streamBuf[data.id] || '') + data.chunk;
+                    streamBufTime[data.id] = Date.now();
                     if (streamBuf[data.id].length > 200000) streamBuf[data.id] = streamBuf[data.id].slice(-200000);
                 }
             } catch (_) {}
+        },
+        direct_send_ack: function(cardId) {
+            try { DynamicThrottle.syncDirectSendSuccess(); } catch (_) {}
+            if (typeof this.onDirectSendSuccess === 'function') {
+                this.onDirectSendSuccess(cardId);
+            }
         },
         onDirectSendSuccess: function(cardId) {
             isExecutingNow = false;
             isFeedbackPending = false;
             feedbackPendingStartedAt = 0;
             executingStartedAt = 0;
+            try {
+                DynamicThrottle.syncDirectSendSuccess();
+            } catch (_) {}
             try {
                 const c = cardControllers[cardId];
                 if (c) {
@@ -1716,7 +1825,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             // result still needs it to pass the receipt-integrity gate.
             if (!isAsyncAck) { try { pendingDispatch.delete(cardId); } catch (_) {} }
             let streamedText = '';
-            try { streamedText = String(streamBuf[cardId] || ''); delete streamBuf[cardId]; } catch (_) {}
+            try { streamedText = String(streamBuf[cardId] || ''); delete streamBuf[cardId]; delete streamBufTime[cardId]; } catch (_) {}
             if (!String((data && data.output) || '').trim() && streamedText.trim()) {
                 try { data.output = streamedText.trim(); } catch (_) {}
             }
@@ -1768,13 +1877,44 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             if (isAttachment && data.base64Data) {
                 try {
                     fileObj = base64ToFile(data.base64Data, data.filename || "attachment.txt", data.mimeType || "text/plain");
-                    if (injectFileToChat(fileObj)) { __attachInjectedAt = Date.now(); }
-                    else {
+                    if (injectFileToChat(fileObj)) {
+                        __attachInjectedAt = Date.now();
+                    } else {
+                        const failReason = 'DOM_REJECTED';
+                        try {
+                            sendToNative({
+                                action: 'attach_failed',
+                                id: cardId,
+                                filename: data.filename || 'attachment.txt',
+                                size: fileObj ? fileObj.size : 0,
+                                reason: failReason
+                            });
+                        } catch (_) {}
+                        try { diagAttach({ phase: 'inject-failed', name: data.filename || '', reason: failReason }); } catch (_) {}
+                        const c = cardControllers[cardId];
+                        if (c) {
+                            try { c.setStatus('附件注入网页失败，已转文本通道', '#ef4444', false); } catch (_) {}
+                        }
+                        try { updateHUD('附件注入网页失败，已转文本通道', '#ef4444'); } catch (_) {}
                         fileObj = null;
-                        try { diagAttach({ phase: 'inject-failed', name: data.filename || '' }); } catch (_) {}
                     }
                 } catch(e) {
                     console.error("[Agent Bridge] Failed to process attachment:", e);
+                    try {
+                        sendToNative({
+                            action: 'attach_failed',
+                            id: cardId,
+                            filename: data.filename || 'attachment.txt',
+                            size: 0,
+                            reason: 'EXCEPTION: ' + (e && e.message ? e.message : String(e))
+                        });
+                    } catch (_) {}
+                    const c = cardControllers[cardId];
+                    if (c) {
+                        try { c.setStatus('附件处理异常，已转文本通道', '#ef4444', false); } catch (_) {}
+                    }
+                    try { updateHUD('附件处理异常，已转文本通道', '#ef4444'); } catch (_) {}
+                    fileObj = null;
                 }
             }
 
@@ -1793,7 +1933,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                     const isImg = (data.mimeType || "").startsWith("image/");
                     const title = isImg ? "📸 屏幕截图已挂载" : "📎 附件文件已挂载";
                     controller.setStatus(`${title}: ${data.filename}`, "#10b981", false);
-                    controller.setOutput(`[${isImg ? "图片" : "文件"}已成功挂载至对话输入框]\n文件名: ${data.filename}\n大小: ${Math.round(fileObj.size / 1024)} KB\n类型: ${data.mimeType}\n\n正在通过 3s 节流安全通道自动发送...`);
+                    controller.setOutput(`[${isImg ? "图片" : "文件"}已成功挂载至对话输入框]\n文件名: ${data.filename}\n大小: ${Math.round(fileObj.size / 1024)} KB\n类型: ${data.mimeType}\n\n正在通过安全节流通道自动同步给 DeepSeek...`);
                 } else {
                     controller.setStatus(isSuccess ? `✅ 执行成功 (退出码: 0)` : `❌ 执行异常 (退出码: ${exitCode})`, isSuccess ? "#10b981" : "#ef4444", false);
                     controller.setOutput(output, !isSuccess);
@@ -1832,101 +1972,88 @@ ${output}
 \`\`\`
 (注：附件未能挂载显示，已转纯文本反馈，请继续。若需继续执行请输出 \`\`\`local_cmd 代码块，若完成请直接解答。)`;
 
-            let countdown = (isAttachment && fileObj) ? 1 : 2;
-            if (controller) {
-                controller.showPacing(countdown, () => {
-                    if (pendingFeedbackTimer) clearTimeout(pendingFeedbackTimer);
-                    sendFeedbackNow();
-                });
-            }
+            const context = {
+                cardId: cardId,
+                isAttachment: isAttachment,
+                hostMs: data.hostMs || 0
+            };
 
-            function sendFeedbackNow() {
+            queueFeedbackSlot(context, (release) => {
                 isFeedbackPending = false;
                 feedbackPendingStartedAt = 0;
-                if (controller) controller.hidePacing();
-                // Serialize on the send slot: fill+click only after the previous
-                // send's completion request has left (or fallback timeout).
-                queueFeedbackSlot((release) => {
-                    try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
-                    noteAction('send-feedback');
-                    const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
-                    updateHUD(hudMsg, "#2563eb");
+                try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
+                noteAction('send-feedback');
+                const hudMsg = isFile ? "同步写入结果给 DeepSeek..." : (isAttachment ? "等待附件就绪并发送..." : "同步执行结果给 DeepSeek...");
+                updateHUD(hudMsg, "#2563eb");
 
-                    if (isAttachment && fileObj) {
-                        // Wait with the box EMPTY (nothing visible), then fill and
-                        // click within ~300ms: the text only flashes, never sits.
-                        waitForAttachmentReady((rushed) => {
-                            if (rushed) {
-                                injectPrompt(fallbackFeedback(), true);
-                                verifySentOrRetry((ok) => {
-                                    release(!!ok);
+                if (isAttachment && fileObj) {
+                    const meta = { size: fileObj.size, filename: data.filename || "attachment.txt" };
+                    waitForAttachmentReady(meta, (res) => {
+                        if (res.timedOut || !res.ok) {
+                            injectPrompt(fallbackFeedback(), true);
+                            verifySentOrRetry((ok) => {
+                                release(!!ok);
+                                burstCollapse();
+                                setTimeout(() => {
+                                    updateHUD("Tool Call 引擎就绪", "#10b981");
+                                    collapseToolFeedbackBubbles();
+                                }, 1500);
+                            });
+                            return;
+                        }
+                        injectPrompt(feedback, false);
+                        try {
+                            const ta = findInputTextarea();
+                            diagAttach({ phase: 'filled', taFound: !!ta, taLen: (ta && (ta.value || '').length) || 0 });
+                        } catch (_) {}
+                        let tries = 0;
+                        const clickIv = setInterval(() => {
+                            tries++;
+                            let ok = false;
+                            try {
+                                const b = findSendButton();
+                                if (b && !isControlDisabled(b)) ok = true;
+                            } catch (_) {}
+                            if (ok || tries >= 15) {
+                                try { clearInterval(clickIv); } catch (_) {}
+                                triggerSend();
+                                verifySentOrRetry((ok2) => {
+                                    release(!!ok2);
                                     burstCollapse();
                                     setTimeout(() => {
                                         updateHUD("Tool Call 引擎就绪", "#10b981");
                                         collapseToolFeedbackBubbles();
                                     }, 1500);
                                 });
-                                return;
                             }
-                            injectPrompt(feedback, false);
-                            try {
-                                const ta = findInputTextarea();
-                                diagAttach({ phase: 'filled', taFound: !!ta, taLen: (ta && (ta.value || '').length) || 0 });
-                            } catch (_) {}
-                            let tries = 0;
-                            const clickIv = setInterval(() => {
-                                tries++;
-                                let ok = false;
-                                try {
-                                    const b = findSendButton();
-                                    if (b && !isControlDisabled(b)) ok = true;
-                                } catch (_) {}
-                                if (ok || tries >= 15) {
-                                    try { clearInterval(clickIv); } catch (_) {}
-                                    triggerSend();
-                                    verifySentOrRetry((ok2) => {
-                                        release(!!ok2);
-                                        burstCollapse();
-                                        setTimeout(() => {
-                                            updateHUD("Tool Call 引擎就绪", "#10b981");
-                                            collapseToolFeedbackBubbles();
-                                        }, 1500);
-                                    });
-                                }
-                            }, 100);
-                        });
-                    } else {
-                        injectPrompt(feedback, true);
-                        burstCollapse();
-                        // Slot covers injectPrompt's internal 500ms delayed click;
-                        // verify the send actually left instead of assuming.
-                        setTimeout(() => {
-                            verifySentOrRetry((ok) => {
-                                if (ok) { release(true); return; }
-                                // v4.3.9: one re-fill retry, then FAIL VISIBLY (never silent-drop).
-                                // Covers the lost-async-final class: result died between card and composer.
-                                try { injectPrompt(feedback, true); } catch (_) {}
-                                setTimeout(() => {
-                                    verifySentOrRetry((ok2) => {
-                                        release(!!ok2);
-                                        if (!ok2 && controller) {
-                                            try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
-                                            try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
-                                        }
-                                    }, true);
-                                }, 700);
-                            }, true);
-                        }, 700);
-                        setTimeout(() => {
-                            updateHUD("Tool Call 引擎就绪", "#10b981");
-                            collapseToolFeedbackBubbles();
-                        }, 1500);
-                    }
-                });
-            }
+                        }, 100);
+                    });
+                } else {
+                    injectPrompt(feedback, true);
+                    burstCollapse();
+                    setTimeout(() => {
+                        verifySentOrRetry((ok) => {
+                            if (ok) { release(true); return; }
+                            try { injectPrompt(feedback, true); } catch (_) {}
+                            setTimeout(() => {
+                                verifySentOrRetry((ok2) => {
+                                    release(!!ok2);
+                                    if (!ok2 && controller) {
+                                        try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
+                                        try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
+                                    }
+                                }, true);
+                            }, 700);
+                        }, true);
+                    }, 700);
+                    setTimeout(() => {
+                        updateHUD("Tool Call 引擎就绪", "#10b981");
+                        collapseToolFeedbackBubbles();
+                    }, 1500);
+                }
+            });
 
             try { diagAttach({ phase: 'result-queued', id: String(cardId) }); } catch (_) {}
-            pendingFeedbackTimer = setTimeout(sendFeedbackNow, (countdown * 1000));
             } catch (err) {
                 try { diagAttach({ phase: 'result-crash', msg: String((err && err.message) || err).slice(0, 160) }); } catch (_) {}
                 try { updateHUD('结果处理异常，已记录', '#ef4444'); } catch (_) {}
@@ -2565,4 +2692,10 @@ ${output}
     } catch (e) {
         console.error("[Agent Bridge] FATAL init error: " + (e && e.stack ? e.stack : e));
     }
+
+    try {
+        if (typeof module !== 'undefined' && module.exports) {
+            module.exports = { DynamicThrottle, queueFeedbackSlot, waitForAttachmentReady };
+        }
+    } catch (_) {}
 })();
