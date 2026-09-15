@@ -159,18 +159,11 @@ namespace DeepSeek
             // Global shortcut handler that works even when WebView2 is focused
             ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
 
-            // Low-level keyboard hook: WebView2's native child window bypasses the
-            // WPF dispatcher pump, so ComponentDispatcher never sees keys pressed
-            // while the page has focus. WH_KEYBOARD_LL sees them system-wide; we
-            // only act when OUR window is foreground, everyone else unaffected.
-            _llHookProc = LowLevelKeyboardProc;
-            _llHookId = SetWindowsHookEx(WH_KEYBOARD_LL, _llHookProc, GetModuleHandle(null), 0);
-            App.Log($"LL keyboard hook installed: {_llHookId != IntPtr.Zero}");
+            InitializeWebViewHotkeys();
 
             Loaded += MainWindow_Loaded;
             Closed += (s, e) =>
             {
-                try { if (_llHookId != IntPtr.Zero) { UnhookWindowsHookEx(_llHookId); _llHookId = IntPtr.Zero; } } catch {}
                 try { lock (_poolLock) { _runspace?.Dispose(); _runspace = null; } } catch {}
                 try { _apiClient.Dispose(); } catch {}
             };
@@ -187,56 +180,83 @@ namespace DeepSeek
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint msg, uint action, IntPtr pChangeFilterStruct);
 
-        private const int WH_KEYBOARD_LL = 13;
-        private const int WM_KEYDOWN_LL = 0x0100;
-        private const int WM_SYSKEYDOWN_LL = 0x0104;
-        private const int VK_CONTROL_LL = 0x11;
-        private const int VK_I_LL = 0x49;
-
-        private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
-
-        [DllImport("user32.dll")]
-        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+        private const int VK_CONTROL = 0x11;
 
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
+        private long _lastHotkeyTicks = 0;
+        private const long HotkeyDebounceTicks = 500 * TimeSpan.TicksPerMillisecond; // 500ms 防抖门
 
-        private HookProc? _llHookProc;
-        private IntPtr _llHookId = IntPtr.Zero;
-
-        private IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
+        private void InitializeWebViewHotkeys()
         {
-            try
+            webView.PreviewKeyDown += (sender, args) =>
             {
-                if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN_LL || wParam == (IntPtr)WM_SYSKEYDOWN_LL))
+                if (args.Key == Key.I)
                 {
-                    int vk = Marshal.ReadInt32(lParam);
-                    if (vk == VK_I_LL && (GetAsyncKeyState(VK_CONTROL_LL) & 0x8000) != 0)
+                    bool isCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                    if (isCtrl)
                     {
-                        var mine = new WindowInteropHelper(this).Handle;
-                        if (mine != IntPtr.Zero && GetForegroundWindow() == mine)
+                        long now = DateTime.UtcNow.Ticks;
+                        if (now - _lastHotkeyTicks > HotkeyDebounceTicks)
                         {
-                            App.Log("[Hotkey] Ctrl+I intercepted (llhook)");
+                            _lastHotkeyTicks = now;
+                            App.Log("[Hotkey] Ctrl+I intercepted via webView.PreviewKeyDown");
                             Dispatcher.BeginInvoke(new Action(() => MenuInjectPrompt_Click(this, new RoutedEventArgs())));
-                            return (IntPtr)1;
                         }
+                        args.Handled = true;
                     }
                 }
+            };
+
+            webView.CoreWebView2InitializationCompleted += (sender, args) =>
+            {
+                try
+                {
+                    AttachControllerAcceleratorKeyPressed();
+                }
+                catch (Exception ex)
+                {
+                    App.Log($"[Hotkey] AttachControllerAcceleratorKeyPressed error: {ex.Message}");
+                }
+            };
+        }
+
+        private void AttachControllerAcceleratorKeyPressed()
+        {
+            var baseField = typeof(Microsoft.Web.WebView2.Wpf.WebView2).GetField("m_webview2Base", BindingFlags.Instance | BindingFlags.NonPublic);
+            var baseObj = baseField?.GetValue(webView);
+            if (baseObj == null) return;
+            var ctrlProp = baseObj.GetType().GetProperty("CoreWebView2Controller", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var controller = ctrlProp?.GetValue(baseObj) as CoreWebView2Controller;
+            if (controller != null)
+            {
+                controller.AcceleratorKeyPressed += (sender, args) =>
+                {
+                    if (args.KeyEventKind == CoreWebView2KeyEventKind.KeyDown ||
+                        args.KeyEventKind == CoreWebView2KeyEventKind.SystemKeyDown)
+                    {
+                        // 73 = 'I'
+                        if (args.VirtualKey == 73)
+                        {
+                            // 使用 Win32 GetAsyncKeyState 规避 WebView2 内部获焦时 WPF Keyboard.Modifiers 失步问题
+                            bool isCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                            if (isCtrl)
+                            {
+                                long now = DateTime.UtcNow.Ticks;
+                                if (now - _lastHotkeyTicks > HotkeyDebounceTicks)
+                                {
+                                    _lastHotkeyTicks = now;
+                                    App.Log("[Hotkey] Ctrl+I intercepted via webView.AcceleratorKeyPressed");
+                                    Dispatcher.BeginInvoke(new Action(() => MenuInjectPrompt_Click(this, new RoutedEventArgs())));
+                                }
+                                // 标记 Handled=true，阻止 Chromium 触发默认行为及冒泡回 WPF 消息泵导致二次触发
+                                args.Handled = true;
+                            }
+                        }
+                    }
+                };
+                App.Log("[Hotkey] CoreWebView2Controller.AcceleratorKeyPressed attached successfully");
             }
-            catch {}
-            return CallNextHookEx(_llHookId, nCode, wParam, lParam);
         }
 
         private const uint MSGFLT_ALLOW = 1;
@@ -323,6 +343,7 @@ namespace DeepSeek
                     }
                 }
                 App.Log("EnsureCoreWebView2Async done");
+                AttachControllerAcceleratorKeyPressed();
 
                 webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
