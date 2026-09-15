@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.20 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.21 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1248,7 +1248,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.20', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.21', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1353,6 +1353,34 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     }
 
     // 5. Hide / Collapse Ugly User Feedback Messages into Sleek Compact Badges!
+    // v4.3.21: trigger ONLY on full feedback signatures we emit. The old bare
+    // "[Tool Call" prefix also matched assistant chatter quoting results.
+    function isFeedbackTriggerText(v) {
+        v = v || '';
+        return v.startsWith('[Tool Call Result (Exit:') ||
+            v.startsWith('[Tool Call 附件就绪]') ||
+            v.startsWith('【本地工具执行结果');
+    }
+
+    // v4.3.21: fail-closed root decision for feedback folding. Collapse ONLY
+    // roots that are positively user-side; assistant-side roots (or anything
+    // ambiguous) are left alone -- folding is cosmetic, over-folding is not.
+    function isCollapsibleFeedbackRoot(root) {
+        try {
+            let cn = '';
+            try { cn = String(root.className || ''); } catch (_) {}
+            // Assistant evidence on the root -> never collapse.
+            if (/assistant|ai-message|\bbot\b|gpt|deepseek|ds-assistant/i.test(cn)) return false;
+            try {
+                if (root.querySelector && root.querySelector('.ds-assistant-message-main-content,[data-role="assistant"]')) return false;
+            } catch (_) {}
+            // Positive user evidence required (d29f3d7d = site user-bubble hash).
+            if (cn.includes('d29f3d7d')) return true;
+            if (/\buser\b|sender|human|mine|myself|\bright\b|usermessage|user-message/i.test(cn)) return true;
+            return false;
+        } catch (_) { return false; }
+    }
+
     function collapseToolFeedbackBubbles() {
         // The MutationObserver now watches `document`, so this can fire before <body> exists
         // (WebView2 runs the script at document-creation). createTreeWalker requires a Node.
@@ -1362,33 +1390,37 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const textNodes = [];
         while (node = walker.nextNode()) {
             const v = (node.nodeValue || '').trim();
-            if (v.startsWith('[Tool Call') || v.startsWith('【本地工具执行结果')) {
+            if (isFeedbackTriggerText(v)) {
                 textNodes.push(node);
             }
         }
 
         for (let tn of textNodes) {
+            // v4.3.21: never touch our own UI cards/pills.
+            try {
+                if (tn.parentElement && tn.parentElement.closest &&
+                    tn.parentElement.closest('[id^="agent-"], [id^="tool-card-"], .agent-tool-card, .agent-collapsed-pill')) continue;
+            } catch (_) {}
+            // Find the message ROOT first, then decide once -- fail CLOSED.
+            // Old code collapsed the first mid-level wrapper whose class merely
+            // contained "message", which also matches assistant-side wrappers
+            // and folded DeepSeek's own messages quoting tool results.
             let container = tn.parentElement;
-            // Climb up to the user message wrapper or bubble
             while (container && container !== document.body) {
-                if (collapsedBubblesSet.has(container)) break;
+                let rcn = '';
+                try { rcn = String(container.className || ''); } catch (_) {}
+                let rrole = '';
+                try { rrole = container.getAttribute ? (container.getAttribute('role') || '') : ''; } catch (_) {}
+                let rmid = false;
+                try { rmid = !!(container.hasAttribute && container.hasAttribute('data-message-id')); } catch (_) {}
+                if (/\bchat-item\b|\bmessage-item\b/.test(rcn) || rrole === 'article' || rmid) break;
+                container = container.parentElement;
+            }
+            if (!container || container === document.body) continue;
+            if (collapsedBubblesSet.has(container)) continue;
+            if (!isCollapsibleFeedbackRoot(container)) continue;
 
-                // Never collapse assistant message containers
-                if ((container.classList && container.classList.contains('ds-assistant-message-main-content')) ||
-                    (container.querySelector && container.querySelector('.ds-assistant-message-main-content'))) {
-                    break;
-                }
-
-                // Check if this container is a user message container
-                const isMsg = container.classList && (
-                    container.className.includes('chat-item') ||
-                    container.className.includes('message') ||
-                    container.className.includes('user') ||
-                    container.getAttribute('role') === 'article' ||
-                    (container.parentElement && container.parentElement.className.includes('chat-item'))
-                );
-
-                if (isMsg && !collapsedBubblesSet.has(container)) {
+            {
                     collapsedBubblesSet.add(container);
 
                     // Create compact pill
@@ -1439,10 +1471,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                     container.appendChild(pill);
                     container.appendChild(contentWrapper);
                     try { window.__collapsedBubbles = (window.__collapsedBubbles || 0) + 1; hideGlobal('__collapsedBubbles'); } catch (_) {}
-                    break;
                 }
-                container = container.parentElement;
-            }
         }
     }
 
