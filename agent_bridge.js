@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.21 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.22 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -1248,7 +1248,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.21', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.22', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
@@ -1381,6 +1381,25 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         } catch (_) { return false; }
     }
 
+    // v4.3.22: one-shot fold probe -- reports the real message-root classes
+    // into the native log so the collapse allowlist can be corrected.
+    const foldDebugLogged = new WeakSet();
+    function foldDbg(root, why) {
+        try {
+            if (!root || foldDebugLogged.has(root)) return;
+            foldDebugLogged.add(root);
+            const chain = [];
+            let el = root, n = 0;
+            while (el && el !== document.body && n < 4) {
+                let c = '';
+                try { c = String(el.className || '').slice(0, 100); } catch (_) {}
+                chain.push(el.tagName + '|' + c);
+                el = el.parentElement; n++;
+            }
+            diagAttach({ phase: 'fold-dbg', why: why, chain: chain.join(' > ').slice(0, 400) });
+        } catch (_) {}
+    }
+
     function collapseToolFeedbackBubbles() {
         // The MutationObserver now watches `document`, so this can fire before <body> exists
         // (WebView2 runs the script at document-creation). createTreeWalker requires a Node.
@@ -1416,9 +1435,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 if (/\bchat-item\b|\bmessage-item\b/.test(rcn) || rrole === 'article' || rmid) break;
                 container = container.parentElement;
             }
-            if (!container || container === document.body) continue;
+            if (!container || container === document.body) { foldDbg(tn.parentElement, 'no-root'); continue; }
             if (collapsedBubblesSet.has(container)) continue;
-            if (!isCollapsibleFeedbackRoot(container)) continue;
+            if (!isCollapsibleFeedbackRoot(container)) { foldDbg(container, 'fail-closed'); continue; }
 
             {
                     collapsedBubblesSet.add(container);
