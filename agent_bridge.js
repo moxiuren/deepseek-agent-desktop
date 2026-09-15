@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.18 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.19 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -493,16 +493,23 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         let codeEl = blockNode.querySelector('.md-code-block-content code, pre code, code');
         let rawText = codeEl ? (codeEl.innerText || codeEl.textContent) : (blockNode.innerText || blockNode.textContent);
 
-        const lines = (rawText || '').split(/\r?\n/).filter(line => {
+        // v4.3.19: strip fence delimiters ONLY at head/tail. Inner fence
+        // lines (N-backtick outer wrapping ``` content, e.g. here-strings
+        // writing markdown) are legitimate command content and must survive.
+        const rawLines = (rawText || '').split(/\r?\n/);
+        while (rawLines.length && !rawLines[0].trim()) rawLines.shift();
+        while (rawLines.length && !rawLines[rawLines.length - 1].trim()) rawLines.pop();
+        // leading open-fence line incl. "- ```local_cmd" list form (v4.3/v4.3.1)
+        if (rawLines.length && /^\s*(-\s*)?`{3,}\s*(local_cmd|bash|sh|powershell|pwsh|write_file|write-file)\b/i.test(rawLines[0])) rawLines.shift();
+        // trailing close-fence line
+        if (rawLines.length && /^\s*`{3,}\s*$/.test(rawLines[rawLines.length - 1])) rawLines.pop();
+        const lines = rawLines.filter(line => {
             const t = line.trim();
             if (!t) return false;
             if (t === 'Copy' || t === 'Download' || t === '复制' || t === '下载') return false;
             if (t.includes('local_cmdCopyDownload')) return false;
             if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
             if (/local_cmd/i.test(t) && /(?:Copy|Download|复制|下载)/i.test(t)) return false;
-            // v4.3/v4.3.1: 围栏分隔行（含 "- ```local_cmd" 列表符形态及尾部围栏）永不进入命令
-            if (/^\s*(-\s*)?```/.test(line)) return false;
-            if (/^\s*```\s*$/.test(line)) return false;
             return true;
         });
 
@@ -961,9 +968,9 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                               /language-(local_cmd|bash|sh|powershell|pwsh)\b/i.test(codeLang + ' ' + parentCls + ' ' + elCls);
 
             // 2. 文本第一行或内容中带围栏标记
-            const hasFencePattern = /^(?:-\s*)?(?:```)?\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(firstLine) ||
+            const hasFencePattern = /^(?:-\s*)?(?:`{3,})?\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(firstLine) ||
                                     /^local_cmd(?:Copy|Download|复制|下载)/i.test(firstLine) ||
-                                    /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText);
+                                    /(?:^|\n)\s*(?:-\s*)?`{3,}\s*(local_cmd|bash|sh|powershell|pwsh)\b/i.test(fullText);
 
             // 3. 显式其他语言防护（如 ```text, ```json 等，防讨论 local_cmd 关键字时被误判）
             const isOtherExplicitLang = bannerText && !/^(local_cmd|bash|sh|powershell|pwsh)\b/i.test(bannerText) &&
@@ -982,7 +989,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             if (!isLocalCmd && !isFileWrite) continue;
             foundAny = true;
             // v4.3.7 async lane (P1-b): explicit `local_cmd:async` infostring routes to host background jobs.
-            const isAsyncCall = /local_cmd:async/i.test(bannerText + '\n' + firstLine) || /```\s*local_cmd:async/i.test(fullText);
+            const isAsyncCall = /local_cmd:async/i.test(bannerText + '\n' + firstLine) || /`{3,}\s*local_cmd:async/i.test(fullText);
 
             let cleanCmd = "";
             let fileContent = "";
@@ -1136,13 +1143,15 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                 // fences (e.g. here-strings writing markdown) no longer truncate
                 // the command. Fallback handles one streaming command per scope;
                 // multi-block messages go through the DOM block path above.
-                const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*)\r?\n\s*```/i;
-                const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?```\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*)\r?\n\s*```/i;
+                // v4.3.19 P2: 3+ backtick fences so ````local_cmd can wrap ```
+                // content (CommonMark: outer run must exceed any inner run).
+                const writeFenceRe = /(?:^|\n)\s*(?:-\s*)?`{3,}\s*(?:write_file|write-file):\s*([^\s\n\r]+)[^\n]*\r?\n([\s\S]*)\r?\n\s*`{3,}/i;
+                const cmdFenceRe = /(?:^|\n)\s*(?:-\s*)?`{3,}\s*(local_cmd|bash|sh|powershell|pwsh)\b[^\n]*\r?\n([\s\S]*)\r?\n\s*`{3,}/i;
 
                 const writeMatch = scopeText.match(writeFenceRe);
                 const cmdMatch = !writeMatch ? scopeText.match(cmdFenceRe) : null;
                 // v4.3.7 async lane (P1-b): explicit fenced `local_cmd:async` infostring.
-                const isAsyncCall = /```\s*local_cmd:async/i.test(scopeText);
+                const isAsyncCall = /`{3,}\s*local_cmd:async/i.test(scopeText);
 
                 if (writeMatch) {
                     const rawPath = writeMatch[1];
@@ -1239,7 +1248,7 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
         const nowMs = Date.now();
         const normCmd = String(command).replace(/\s+/g, ' ').trim();
         addProcessedSig('cmd:' + normCmd);
-        try { diagAttach({ phase: 'dispatch', v: '4.3.18', cmd: normCmd.slice(0, 300) }); } catch (_) {}
+        try { diagAttach({ phase: 'dispatch', v: '4.3.19', cmd: normCmd.slice(0, 300) }); } catch (_) {}
         if (normCmd === lastDispatch.cmd && nowMs - lastDispatch.at < 5000) {
             controller.setStatus('重复调用已合并（5s内相同命令）', '#8b5cf6', false);
             controller.setOutput('与上一条完全相同的命令在短时间内重复下发，已自动合并，不再重复执行。');
