@@ -21,8 +21,14 @@ if (-not $TestOnly) {
     dotnet restore DeepSeek.csproj
 
     Write-Host "[2/3] Building and publishing..." -ForegroundColor Yellow
-    # 注意：禁止 PublishSingleFile（PowerShell SDK 单文件下 Assembly.Location 为空会崩，见 csproj 注释）
     dotnet publish DeepSeek.csproj -c Release -r win-x64 --self-contained false -o publish
+
+    $rootBridge = Join-Path (Split-Path $ScriptDir -Parent) "agent_bridge.js"
+    $targetBridge = Join-Path $ScriptDir "publish\agent_bridge.js"
+    if (Test-Path $rootBridge) {
+        Copy-Item -Path $rootBridge -Destination $targetBridge -Force
+        Write-Host "[Sync] Synced root agent_bridge.js to publish directory" -ForegroundColor Green
+    }
 
     Write-Host "[3/3] Build completed successfully!" -ForegroundColor Green
     Write-Host "Executable generated at: $ScriptDir\publish\DeepSeek.exe" -ForegroundColor Green
@@ -56,7 +62,40 @@ if (-not $SkipTests) {
 
     Write-Host ""
     Write-Host "========================================================" -ForegroundColor Green
-    Write-Host "  RFC-0004 ACCEPTANCE REPORT: ALL $passedCount/4 VERIFICATIONS PASSED" -ForegroundColor Green
+    Write-Host "  RFC-0004 ACCEPTANCE REPORT: ALL $passedCount/4 PASSED" -ForegroundColor Green
+    Write-Host "========================================================" -ForegroundColor Green
+
+    Write-Host ""
+    Write-Host "========================================================" -ForegroundColor Cyan
+    Write-Host "  Running RFC-0005 Automated Verification Suite" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
+
+    $rfc0005Scripts = @(
+        "scripts\verify-rfc0005-router.ps1",
+        "scripts\verify-rfc0005-bridge-dynamic.ps1",
+        "scripts\verify-rfc0005-bridge-sync.ps1"
+    )
+
+    $passedCount5 = 0
+    foreach ($ts in $rfc0005Scripts) {
+        $fullPath = Join-Path $ScriptDir $ts
+        Write-Host ""
+        Write-Host "--- [RUN] $ts ---" -ForegroundColor Yellow
+        $argsList = @("-NoProfile", "-File", $fullPath)
+        if ($TestOnly) {
+            $argsList += "-TestOnly"
+        }
+        & pwsh @argsList
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "[FAIL] Verification script failed: $ts (ExitCode: $LASTEXITCODE)"
+            exit $LASTEXITCODE
+        }
+        $passedCount5++
+    }
+
+    Write-Host ""
+    Write-Host "========================================================" -ForegroundColor Green
+    Write-Host "  RFC-0005 ACCEPTANCE REPORT: ALL $passedCount5/3 PASSED" -ForegroundColor Green
     Write-Host "  Status: FULL GREEN (0 Errors, 0 Warnings)" -ForegroundColor Green
     Write-Host "========================================================" -ForegroundColor Green
 }

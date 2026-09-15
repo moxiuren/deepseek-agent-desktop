@@ -319,7 +319,7 @@ namespace DeepSeek
 
                 // Optional remote-debugging port (set DEEPSEEK_DEBUG_PORT to enable CDP introspection)
                 var envOptions = new CoreWebView2EnvironmentOptions();
-                string dbgPort = Environment.GetEnvironmentVariable("DEEPSEEK_DEBUG_PORT");
+                string? dbgPort = Environment.GetEnvironmentVariable("DEEPSEEK_DEBUG_PORT");
                 if (!string.IsNullOrWhiteSpace(dbgPort))
                 {
                     envOptions.AdditionalBrowserArguments = $"--remote-debugging-port={dbgPort} --remote-allow-origins=*";
@@ -628,6 +628,14 @@ namespace DeepSeek
                     }
                     catch {}
                 }
+                else if (action == "attach_failed")
+                {
+                    string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "";
+                    string file = root.TryGetProperty("filename", out var fProp) ? fProp.GetString() ?? "" : "";
+                    string reason = root.TryGetProperty("reason", out var rProp) ? rProp.GetString() ?? "" : "";
+                    App.Log($"[AttachFailed] id={id} file={file} reason={reason}");
+                    UpdateStatus("附件注入网页失败，已自动降级为文本通道", isWarning: true);
+                }
                 else if (action == "execute")
                 {
                     string cmd = root.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
@@ -770,7 +778,7 @@ namespace DeepSeek
                     {
                         id = id,
                         exitCode = 0,
-                        output = $"文件已成功直接落盘写入：{resolvedPath}（共 {Encoding.UTF8.GetByteCount(content)} 字节）。"
+                        output = $"文件已成功直接落盘写入：{resolvedPath}（共 {Encoding.UTF8.GetByteCount(content ?? "")} 字节）。"
                     };
                     string json = JsonSerializer.Serialize(payload);
                     string js = $"window.__agentBridge && window.__agentBridge.onCommandResult({json});";
@@ -1194,15 +1202,21 @@ namespace DeepSeek
                 outputCol.DataAdded += (sender, e) =>
                 {
                     string? line = null;
-                    try { line = ((PSDataCollection<PSObject>)sender)[e.Index]?.ToString(); } catch { return; }
+                    if (sender is PSDataCollection<PSObject> col)
+                    {
+                        try { line = col[e.Index]?.ToString(); } catch { return; }
+                    }
                     if (!string.IsNullOrEmpty(line)) StreamChunk(line);
                 };
                 ps.Streams.Error.DataAdded += (sender, e) =>
                 {
                     string msg;
-                    try { msg = FormatErrorRecord(((PSDataCollection<ErrorRecord>)sender)[e.Index]); }
-                    catch { return; }
-                    StreamChunk("[STDERR] " + msg);
+                    if (sender is PSDataCollection<ErrorRecord> errCol)
+                    {
+                        try { msg = FormatErrorRecord(errCol[e.Index]); }
+                        catch { return; }
+                        StreamChunk("[STDERR] " + msg);
+                    }
                 };
 
                 System.Collections.Generic.IList<PSObject>? results = null;
@@ -1283,70 +1297,19 @@ namespace DeepSeek
                     output = "(命令执行完毕，无终端文字输出)";
                 }
 
-                // 1. Check for explicit attach directive: [[AGENT_ATTACH_FILE:filepath:prompt]]
-                var match = System.Text.RegularExpressions.Regex.Match(output, @"\[\[AGENT_ATTACH_FILE:(.+?)\]\]");
-                if (match.Success)
-                {
-                    string inner = match.Groups[1].Value;
-                    string[] parts = inner.Split(new[] { ':' }, 2);
-                    string filePath = parts[0].Trim();
-                    string prompt = parts.Length > 1 ? parts[1].Trim() : "";
-
-                    filePath = Environment.ExpandEnvironmentVariables(filePath);
-                    if (File.Exists(filePath))
-                    {
-                        byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
-                        if (fileBytes.Length <= MaxUploadBytes)
-                        {
-                            string b64 = Convert.ToBase64String(fileBytes);
-                            string filename = Path.GetFileName(filePath);
-                            string mime = GetMimeType(Path.GetExtension(filePath));
-
-                            await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: mime, base64Data: b64, prompt: prompt);
-                        }
-                        else
-                        {
-                            // Too big to upload: keep on local disk, reference by path.
-                            string fullText = File.Exists(filePath) ? await File.ReadAllTextAsync(filePath, Encoding.UTF8) : "";
-                            var (fbOut, fbPrompt, _) = await HandleOversizedOutputAsync(string.IsNullOrEmpty(fullText) ? output : fullText);
-                            string note = prompt + "\n\n" + fbPrompt;
-                            await FeedResultBackAsync(id, exitCode, fbOut, isAttachment: false, prompt: note);
-                        }
-                        return;
-                    }
-                }
-
-                // 2. Check for oversized terminal output (> 6000 chars) -> auto package as attachment!
-                if (output.Length > 6000)
-                {
-                    int bytesLen = Encoding.UTF8.GetByteCount(output);
-                    if (bytesLen <= MaxUploadBytes)
-                    {
-                        string tempFile = Path.Combine(Path.GetTempPath(), $"agent_output_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.txt");
-                        await File.WriteAllTextAsync(tempFile, output, Encoding.UTF8);
-                        byte[] fileBytes = await File.ReadAllBytesAsync(tempFile);
-                        string b64 = Convert.ToBase64String(fileBytes);
-                        string filename = Path.GetFileName(tempFile);
-                        string prompt = $"终端输出内容较长（共 {output.Length} 字符），已自动打包为附件 {filename} 供你直接阅读分析。";
-
-                        await FeedResultBackAsync(id, exitCode, output, isAttachment: true, filename: filename, mimeType: "text/plain", base64Data: b64, prompt: prompt);
-                    }
-                    else
-                    {
-                        var (fbOut, fbPrompt, _) = await HandleOversizedOutputAsync(output);
-                        await FeedResultBackAsync(id, exitCode, fbOut, isAttachment: false, prompt: fbPrompt);
-                    }
-                    return;
-                }
-
-                // Smart truncation: keep first 4000 and last 4000 characters
-                int maxChars = 8000;
-                if (output.Length > maxChars)
-                {
-                    string head = output.Substring(0, 4000);
-                    string tail = output.Substring(output.Length - 4000);
-                    output = $"{head}\n\n...[输出过长，已折叠中间 {output.Length - maxChars} 字符]...\n\n{tail}";
-                }
+                string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string baseDir = Path.Combine(localAppData, "DeepSeek");
+                var routeResult = TerminalOutputRouter.Route(output, baseDir);
+                await FeedResultBackAsync(
+                    id,
+                    exitCode,
+                    routeResult.OutputText,
+                    isAttachment: routeResult.IsAttachment,
+                    filename: routeResult.Filename,
+                    mimeType: routeResult.MimeType,
+                    base64Data: routeResult.Base64Data,
+                    prompt: routeResult.Prompt);
+                return;
             }
             catch (Exception ex)
             {
@@ -1354,10 +1317,8 @@ namespace DeepSeek
                 LiveStreamCmdlet.Sink = null;
                 output = $"执行失败: {ex.Message}";
                 App.Log($"[Execute] FAILED id={id} cmd-head={command.Substring(0, Math.Min(120, command.Length))} ex={ex}");
+                await FeedResultBackAsync(id, exitCode, output);
             }
-
-            // Feed result back (direct API send if enabled, otherwise fallback to web input box)
-            await FeedResultBackAsync(id, exitCode, output);
             }
             finally
             {
@@ -1631,7 +1592,7 @@ function global:Start-Job {
             {
                 try
                 {
-                    DirectResult? direct = await TryDirectSendAsync(id, exitCode, output, isAttachment, filename, mimeType, base64Data, prompt);
+                    DirectResult? direct = await TryDirectSendAsync(id, exitCode, output ?? "", isAttachment, filename, mimeType, base64Data, prompt);
                     if (direct != null && direct.Ok)
                     {
                         // Chain the next turn on OUR OWN reply id (page sniffing goes stale in direct mode).
@@ -1678,6 +1639,7 @@ function global:Start-Job {
                         exitCode = exitCode,
                         output = output,
                         isAttachment = isAttachment,
+                        hostMs = hostMs,
                         filename = filename,
                         mimeType = mimeType,
                         base64Data = base64Data,
@@ -1697,6 +1659,11 @@ function global:Start-Job {
                     Trace.WriteLine($"[FeedResult Error]: {ex.Message}");
                 }
             });
+        }
+
+        private void UpdateStatus(string message, bool isWarning = false)
+        {
+            App.Log($"[Status] {(isWarning ? "WARN: " : "")}{message}");
         }
 
         private async Task<DirectResult?> TryDirectSendAsync(
