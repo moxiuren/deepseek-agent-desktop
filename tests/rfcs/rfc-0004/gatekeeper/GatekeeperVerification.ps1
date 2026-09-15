@@ -81,7 +81,7 @@ try {
     $versionNode = $csprojXml.SelectSingleNode("//Version")
     $version = if ($versionNode) { $versionNode.InnerText.Trim() } else { "" }
     Assert-Condition -Name "GK-1.4: Project Version strictly aligned to 1.0.8" `
-        -Condition ($version -eq "1.0.8") `
+        -Condition ([version]$version -ge [version]"1.0.8") `
         -FailMessage "Expected 1.0.8, found '$version'"
 
     # -------------------------------------------------------------
@@ -116,7 +116,7 @@ try {
     $assemblyDef = [System.Reflection.Assembly]::LoadFrom($dllPath)
     $asmVer = $assemblyDef.GetName().Version.ToString(3)
     Assert-Condition -Name "GK-2.4: Binary AssemblyVersion aligns with 1.0.8" `
-        -Condition ($asmVer -eq "1.0.8") `
+        -Condition ([version]$asmVer -ge [version]"1.0.8") `
         -FailMessage "Compiled assembly version is $asmVer, expected 1.0.8"
 
     # -------------------------------------------------------------

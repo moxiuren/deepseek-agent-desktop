@@ -1,5 +1,5 @@
 # verify-build-version.ps1 - RFC-0004 Chapter 11.4 Verification
-# Asserts csproj version alignment to 1.0.8 and successful Release build.
+# Asserts csproj version alignment to 1.0.9 and successful Release build.
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -8,7 +8,7 @@ $RepoRoot = Split-Path -Parent $WindowsDir
 
 Write-Host "[INFO] Starting verification: Version alignment and Release build..." -ForegroundColor Cyan
 
-# 1. Parse windows/DeepSeek.csproj and assert <Version> == 1.0.8
+# 1. Parse windows/DeepSeek.csproj and assert <Version> == 1.0.9
 $csprojPath = Join-Path $WindowsDir "DeepSeek.csproj"
 if (-not (Test-Path $csprojPath)) {
     Write-Error "[FAIL] Project file not found: $csprojPath"
@@ -26,11 +26,11 @@ if (-not $versionNode) {
 $versionValue = $versionNode.InnerText.Trim()
 Write-Host "[INFO] Detected version: $versionValue"
 
-if ($versionValue -ne "1.0.8") {
-    Write-Error "[FAIL] Version mismatch! Expected: 1.0.8, Actual: $versionValue"
+if ($versionValue -ne "1.0.9") {
+    Write-Error "[FAIL] Version mismatch! Expected: 1.0.9, Actual: $versionValue"
     exit 1
 }
-Write-Host "[PASS] Version is strictly 1.0.8" -ForegroundColor Green
+Write-Host "[PASS] Version is strictly 1.0.9" -ForegroundColor Green
 
 # 2. Execute dotnet build -c Release and assert exit code == 0
 Write-Host "[INFO] Building DeepSeek.csproj with Release configuration..."
