@@ -135,3 +135,8 @@
 ## 📄 License
 
 [MIT License](LICENSE) © 2026 moxiuren
+
+### Third-Party Components（随包分发，署名致谢）
+
+- **DSX whale widget** (`windows/plugins/whale-dsh.js`, `whale.js`) — ported from [DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget) v0.3.0, MIT © 2026 MeteorNOX (see upstream LICENSE). Local changes: DSX runtime shim, forced chat-root gate, label tweaks.
+- **NuGet dependencies** (Microsoft.PowerShell.SDK, Microsoft.Web.WebView2, System.Drawing.Common) — governed by their own package licenses.
