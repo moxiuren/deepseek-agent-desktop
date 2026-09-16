@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.30 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.33 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -62,7 +62,7 @@
 文件内容
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
-Start-Job works natively via host ThreadJob backend (same Job objects: Wait-Job/Receive-Job/Remove-Job all work). Prefer it for background work; local_cmd:async fence remains for the detached lane.
+Start-Job FIXED (host shim auto-loads standard cmdlets inside jobs; Get-Date/Start-Sleep verified). Bare Start-ThreadJob: import HOST dlls first, never Store Modules (version-incompatible with 7.4 host): $b=Split-Path ([Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; 'Utility','Management'|%{Import-Module (Join-Path $b "Microsoft.PowerShell.Commands.$_.dll") -EA Stop}. Detached work: prefer local_cmd:async fence (host runspace, all cmdlets ok).
 ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (fence-line local_cmd:async). The command runs detached without blocking the queue; progress polls automatically; the final result returns to session. Quick commands stay sync.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach，二者裸发单行即执行，也可包在 local_cmd 块里。）
 
@@ -91,13 +91,16 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
     let backoffRetried = false;
 
     // 统一权威单点动态节流引擎 (RFC-0005 Section 8.3)
+    // v4.3.33 发送预算制：红线按"全页面提交"算（用户+他路驱动+我方），只数我方必超。
     const DynamicThrottle = {
         BASE_GAP_TEXT_MS: 1500,
         BASE_GAP_ATTACH_MS: 1500,
         FLOOR_GAP_TEXT_MS: 200,
         WINDOW_MS: 10000,
-        recentSends: [],         // 记录单调时钟时间戳
+        HOLD_AFTER_BURST_MS: 12000,  // v4.3.33 硬保持：窗口内已有2次提交时，第3次等到最旧者滑出窗口+2s
+        recentSends: [],         // 记录单调时钟时间戳（含外部提交）
         lastSendMono: 0,         // 上次发送确认的 performance.now()
+        lastSeenCompletionAt: 0, // v4.3.33 已入账的最大 __lastCompletionAt
 
         clean(nowMono) {
             const boundary = nowMono - this.WINDOW_MS;
@@ -117,29 +120,61 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             this.recordSendCommit(performance.now());
         },
 
+        // v4.3.33: 把全页面提交都记入同一窗口（用户消息、他路驱动、我方反馈）。
+        // api_sniff 在每次 completion-POST 发出时打 window.__lastCompletionAt；
+        // 我方发送已由 recordSendCommit 入账，6s 内的回声跳过防双计（双计偏保守，可接受）。
+        pollExternal() {
+            try {
+                const cur = window.__lastCompletionAt || 0;
+                if (cur > this.lastSeenCompletionAt) {
+                    this.lastSeenCompletionAt = cur;
+                    const nowMono = performance.now();
+                    if (this.lastSendMono === 0 || nowMono - this.lastSendMono > 6000) {
+                        this.recentSends.push(nowMono);
+                    }
+                    this.clean(nowMono);
+                }
+            } catch (_) {}
+        },
+
         evaluate(context) {
             const nowMono = performance.now();
+            try { this.pollExternal(); } catch (_) {}
             this.clean(nowMono);
 
-            // 冷启动首发保护穿透防御
-            if (this.lastSendMono === 0) {
+            const burstCount = this.recentSends.length;
+            // 冷启动首发保护穿透防御（窗口为空才直发；用户刚连发时同样要等）
+            if (this.lastSendMono === 0 && burstCount === 0) {
                 return { remainingWaitMs: 0, targetGap: 0, burstCount: 0 };
             }
 
-            const burstCount = this.recentSends.length;
+            // v4.3.33 硬保持：窗口内已有 2 次提交，我方绝不贡献第 3 次——
+            // 等到最旧者滑出 10s 窗口再加 2s 裕量。数学保证我方任意 10s 内至多 2 次。
+            if (burstCount >= 2) {
+                const oldest = this.recentSends[0];
+                let remainingWaitMs = Math.max(0, oldest + this.HOLD_AFTER_BURST_MS - nowMono);
+                if (typeof rateLimitBackoffUntil !== 'undefined' && rateLimitBackoffUntil > 0) {
+                    const backoffRem = Math.max(0, rateLimitBackoffUntil - Date.now());
+                    if (backoffRem > remainingWaitMs) remainingWaitMs = backoffRem;
+                }
+                return {
+                    remainingWaitMs: Math.round(remainingWaitMs),
+                    targetGap: Math.round(remainingWaitMs),
+                    burstCount
+                };
+            }
+
             let burstPenalty = 0;
-            if (burstCount >= 3) {
+            if (burstCount >= 1) {
                 burstPenalty = 2500;
-            } else if (burstCount >= 2) {
-                burstPenalty = 1000;
             }
 
             const isAttachment = !!(context && context.isAttachment);
             const baseGap = isAttachment ? this.BASE_GAP_ATTACH_MS : this.BASE_GAP_TEXT_MS;
             const targetGap = Math.max(isAttachment ? baseGap : this.FLOOR_GAP_TEXT_MS, baseGap + burstPenalty);
 
-            // 真实单调时钟自然流逝
-            const naturalElapsed = Math.max(0, nowMono - this.lastSendMono);
+            // 真实单调时钟自然流逝（v4.3.33：从未发送过按 0 算，否则外部计数形同虚设）
+            const naturalElapsed = (this.lastSendMono === 0) ? 0 : Math.max(0, nowMono - this.lastSendMono);
             // 宿主执行耗时冲抵 (防御负数)
             const hostOffset = Math.max(0, (context && context.hostMs) || 0);
             const totalEffectiveElapsed = naturalElapsed + hostOffset;
@@ -250,6 +285,10 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                     try { controller.showPacing(countdownSec, firePacing); } catch (_) {}
                 }
                 pacingTimer = setTimeout(firePacing, evalRes.remainingWaitMs);
+                // v4.3.33: 长等待全局可见（防刷频保持/退避），否则用户只看到卡死。
+                if (evalRes.remainingWaitMs > 5000) {
+                    try { updateHUD('发送排队中（防刷频），约' + Math.ceil(evalRes.remainingWaitMs / 1000) + '秒后发出…', '#f59e0b'); } catch (_) {}
+                }
             }
         }));
         return feedbackChain;
@@ -2135,16 +2174,35 @@ ${output}
                     setTimeout(() => {
                         verifySentOrRetry((ok) => {
                             if (ok) { release(true); return; }
-                            try { injectPrompt(feedback, true); } catch (_) {}
-                            setTimeout(() => {
-                                verifySentOrRetry((ok2) => {
-                                    release(!!ok2);
-                                    if (!ok2 && controller) {
-                                        try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
-                                        try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
-                                    }
-                                }, true);
-                            }, 700);
+                            // v4.3.33: 限流下立即重注等于追发——改走发送门排队（等窗口），限 2 次。
+                            const retries = (context.retries || 0) + 1;
+                            context.retries = retries;
+                            try { lastFeedbackForRetry = { text: feedback, at: Date.now() }; backoffRetried = false; } catch (_) {}
+                            if (retries > 2) {
+                                release(false);
+                                if (controller) {
+                                    try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
+                                    try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
+                                }
+                                return;
+                            }
+                            try { updateHUD('发送遇阻，已排队等待发送窗口…', '#f59e0b'); } catch (_) {}
+                            queueFeedbackSlot(context, (release2) => {
+                                try { noteAction('send-feedback-retry'); } catch (_) {}
+                                try { updateHUD('重发排队反馈…', '#2563eb'); } catch (_) {}
+                                try { injectPrompt(feedback, true); } catch (_) {}
+                                burstCollapse();
+                                setTimeout(() => {
+                                    verifySentOrRetry((ok2) => {
+                                        release2(!!ok2);
+                                        release(!!ok2);
+                                        if (!ok2 && controller) {
+                                            try { controller.setStatus('回执发送失败（已重试），结果保留在卡片', '#ef4444', false); } catch (_) {}
+                                            try { updateHUD('回执未送达，结果在卡片', '#ef4444'); } catch (_) {}
+                                        }
+                                    }, true);
+                                }, 700);
+                            });
                         }, true);
                     }, 700);
                     setTimeout(() => {
@@ -2426,8 +2484,26 @@ ${output}
                 try { done(false); } catch (_) {}
                 return;
             }
+            // v4.3.33: 2s 一次看是否撞上站点限流气泡——撞上立刻停手进 90s 冷却，
+            // 不再补点（每次点击都是一次提交，风暴就是这么放大的）。
+            if (tick % 10 === 0) {
+                try {
+                    let f = null;
+                    try { f = findRateLimitError(); } catch (_) {}
+                    if (f && Date.now() - lastAutoSendAt < 30000) {
+                        try { clearInterval(iv); } catch (_) {}
+                        try { enterBackoff('verify-dom', String(f).slice(0, 80)); } catch (_) {}
+                        try { diagAttach({ phase: 'sent-throttled', elapsed: Date.now() - t0, clicks: clicks }); } catch (_) {}
+                        try { done(false); } catch (_) {}
+                        return;
+                    }
+                } catch (_) {}
+            }
             if (tick % 4 === 0) {
-                try { triggerSend(); clicks++; } catch (_) {}
+                // v4.3.33: 冷却期内不补点。
+                let inBackoff = false;
+                try { inBackoff = (typeof rateLimitBackoffUntil !== 'undefined' && rateLimitBackoffUntil > Date.now()); } catch (_) {}
+                if (!inBackoff) { try { triggerSend(); clicks++; } catch (_) {} }
             }
         }, 200);
     }

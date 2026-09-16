@@ -1347,12 +1347,34 @@ namespace DeepSeek
             catch { return ""; }
         }
 
+        // P1-selftest-20260916b: import the HOST's own command assemblies (same version
+        // as the SDK) into every runspace. Store PS7 manifests are version-incompatible
+        // with this 7.4 host ("built-in module compatible with Core edition" load error),
+        // so never point PSModulePath at WindowsApps. Called from EnsureThreadJobCompat,
+        // which runs on ALL runspace paths (sync lane + async lane).
+        private void EnsureHostCommandModules(Runspace rs)
+        {
+            try
+            {
+                using var ps = PowerShell.Create();
+                ps.Runspace = rs;
+                ps.AddScript(@"try { $b = Split-Path ([System.Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; if (-not $b) { $b = Join-Path $env:LOCALAPPDATA 'DeepSeek-Agent' }; foreach ($d in 'Microsoft.PowerShell.Commands.Utility.dll','Microsoft.PowerShell.Commands.Management.dll','Microsoft.PowerShell.Security.dll') { $p = Join-Path $b $d; if (Test-Path -LiteralPath $p) { Import-Module -Name $p -ErrorAction SilentlyContinue } }; @(Get-Command Get-Date, Start-Sleep, Write-Output -ErrorAction SilentlyContinue).Count } catch { -1 }");
+                var res = ps.Invoke();
+                string cnt = "";
+                try { foreach (var o in res) cnt += o?.ToString(); } catch { }
+                App.Log($"[Runspace] HostModules: base=[{AppContext.BaseDirectory}] cmdlets={cnt}");
+                ps.Streams.ClearStreams();
+            }
+            catch (Exception ex) { App.Log($"[Runspace] HostModules unavailable: {ex.Message}"); }
+        }
+
         // P2-b: make in-command Start-Job work inside the hosted runspace by shimming
         // it onto Start-ThreadJob (same Job object model: Wait/Receive/Remove/Stop all work).
         private void EnsureThreadJobCompat(Runspace rs)
         {
             try
             {
+                EnsureHostCommandModules(rs);
                 string psd1 = Path.Combine(ThreadJobModuleDir(), "Microsoft.PowerShell.ThreadJob.psd1");
                 if (!File.Exists(psd1)) { App.Log("[Runspace] ThreadJob module not bundled, skipping compat"); return; }
                 Func<string, string> q = s => "'" + s.Replace("'", "''") + "'";
@@ -1364,6 +1386,11 @@ namespace DeepSeek
                     if (ps.HadErrors) throw new InvalidOperationException("Start-ThreadJob not available after import");
                     ps.Streams.ClearStreams();
                 }
+                // P0-selftest-20260916: wrap user code with a preamble that repairs
+                // $env:PSModulePath + imports Utility/Management INSIDE the job
+                // runspace (ThreadJob children start without standard modules).
+                // Param-safe injection: a leading param(...) block must stay first,
+                // so insert AFTER it when present, else prepend.
                 using (var ps = PowerShell.Create())
                 {
                     ps.Runspace = rs;
@@ -1376,10 +1403,14 @@ function global:Start-Job {
         [string] $Name,
         [string] $WorkingDirectory
     )
-    $sb = $ScriptBlock
+    $pre = 'try { $b = Split-Path ([System.Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; if (-not $b) { $b = Join-Path $env:LOCALAPPDATA ''DeepSeek-Agent'' }; foreach ($d in ''Microsoft.PowerShell.Commands.Utility.dll'',''Microsoft.PowerShell.Commands.Management.dll'',''Microsoft.PowerShell.Security.dll'') { $p = Join-Path $b $d; if (Test-Path -LiteralPath $p) { Import-Module -Name $p -EA SilentlyContinue } } } catch { }'
+    $src = $ScriptBlock.ToString()
+    $m = [regex]::Match($src, '(?s)^\s*param\s*\(.*?\)')
+    if ($m.Success) { $src = $src.Insert($m.Index + $m.Length, '; ' + $pre + '; ') } else { $src = $pre + '; ' + $src }
+    $sb = [scriptblock]::Create($src)
     if ($WorkingDirectory) {
         $cd = ""Set-Location -LiteralPath '$($WorkingDirectory.Replace(""'"", ""''""))'; ""
-        $sb = [scriptblock]::Create($cd + $ScriptBlock.ToString())
+        $sb = [scriptblock]::Create($cd + $sb.ToString())
     }
     $p = @{ ScriptBlock = $sb }
     if ($ArgumentList) { $p.ArgumentList = $ArgumentList }
@@ -1393,11 +1424,14 @@ function global:Start-Job {
                 App.Log("[Runspace] ThreadJob compat ready (Start-Job -> Start-ThreadJob)");
                 // Zero-probe self-test: proves the shim REALLY works in this trimmed runtime
                 // (gallery ThreadJob 2.1.0 was an empty rename-shell; this guards regressions).
+                // P0-selftest-20260916: self-test now exercises REAL cmdlets (Get-Date +
+                // Start-Sleep) inside the job, not just a string literal -- a bare string
+                // passes even when standard modules are missing, which hid this bug.
                 try
                 {
                     using var tst = PowerShell.Create();
                     tst.Runspace = rs;
-                    tst.AddScript("$tj = Start-Job { 'THREADJOB-SELFTEST-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
+                    tst.AddScript("$tj = Start-Job { Get-Date | Out-Null; Start-Sleep -Milliseconds 200; 'THREADJOB-SELFTEST-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
                     var tres = tst.Invoke();
                     string joined = "";
                     try { foreach (var o in tres) joined += (o?.ToString() ?? "") + "|"; } catch { }

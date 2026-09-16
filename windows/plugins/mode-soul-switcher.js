@@ -1,4 +1,5 @@
-/* DSX 插件: mode-soul-switcher v1.0.2
+/* DSX 插件: mode-soul-switcher v1.0.4
+ * v1.0.4: 协议再修正——Store模块清单与7.4宿主版本不兼容（Core edition加载错），Start-Job由shim自带宿主DLL导入，裸Start-ThreadJob改导宿主Commands.*.dll（与bridge v4.3.32同口径）。
  * v1.0.2: 胶囊换 HUD 同款浅色玻璃挂件（与 bridge HUD 单视觉家族；bridge HUD 注入按钮退役，此胶囊为唯一协议入口）。
  * 职责:
  * 1. 提供 [标准模式] / [PTC批处理模式] / [规划模式] 三档切换胶囊;
@@ -32,7 +33,7 @@ module.exports = {
 文件内容
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
-NO Start-Job: Start-Job works natively via host ThreadJob backend (Wait-Job/Receive-Job/Remove-Job all work). For detached background work you may also use local_cmd:async fence or detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log with Get-Content -Tail polling.
+Start-Job FIXED (host shim auto-loads standard cmdlets inside jobs). Bare Start-ThreadJob: import HOST dlls first, never Store Modules (version-incompatible): $b=Split-Path ([Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; 'Utility','Management'|%{Import-Module (Join-Path $b "Microsoft.PowerShell.Commands.$_.dll") -EA Stop}. Detached work: prefer local_cmd:async fence (host runspace, all cmdlets ok) or detached Start-Process logging to C:/Windows/TEMP/opencode/job-NAME.log with Get-Content -Tail polling.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach。）
 
 【闭环规则】：每次只输出一个代码块等真实结果，不编造；收到结果再决策；做完直接总结。铁律四条：①write_file 内容没准备好就别发块，空块会被直接忽略（无回执）；②local_cmd 发前自查括号配对 ()[]{}，配不平桥接层不会执行；③连 9222/CDP 前先跑 Get-NetTCPConnection -LocalPort 9222，无监听直接报"端口已退役"，不硬连；④Exit:1 且报错含 not recognized / Unexpected token / Missing expression → 说明命令被提取错了，换写法重发，严禁原样重发。
