@@ -44,7 +44,7 @@
         });
     });
 
-    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.33 (Cross-Platform Edition)...");
+    console.log("[Agent Bridge] Initializing Tool Call Engine v4.3.35 (Cross-Platform Edition)...");
 
     // Dynamic OS detection for DeepSeek Planner instructions
     const isWindows = typeof navigator !== 'undefined' && (navigator.userAgent.includes("Windows") || (navigator.platform && navigator.platform.startsWith("Win")));
@@ -62,7 +62,7 @@
 文件内容
 \`\`\`
 LONG FILES (>150 lines): do NOT paste via write_file (streaming truncates). Emit a local_cmd PowerShell generator instead (loops or Here-String) that creates the file, then verify with Get-Item .Length.
-Start-Job FIXED (host shim auto-loads standard cmdlets inside jobs; Get-Date/Start-Sleep verified). Bare Start-ThreadJob: import HOST dlls first, never Store Modules (version-incompatible with 7.4 host): $b=Split-Path ([Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; 'Utility','Management'|%{Import-Module (Join-Path $b "Microsoft.PowerShell.Commands.$_.dll") -EA Stop}. Detached work: prefer local_cmd:async fence (host runspace, all cmdlets ok).
+Start-Job + Start-ThreadJob BOTH auto-load host cmdlets (shim + InitializationScript default; Get-Date/Start-Sleep verified both legs). Manual host-DLL import only if you pass explicit -InitializationScript. Detached work: prefer local_cmd:async fence (host runspace, all cmdlets ok).
 ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (fence-line local_cmd:async). The command runs detached without blocking the queue; progress polls automatically; the final result returns to session. Quick commands stay sync.
 （查文件跑脚本走 local_cmd，工作目录 ~/Documents/Projects；写文件走 write_file 自动建目录；agy 的 -p 与免确认必须带，跨目录加 \`--add-dir "目录"\`；截屏用 agent-screenshot，挂大文件用 agent-attach，二者裸发单行即执行，也可包在 local_cmd 块里。）
 
@@ -557,7 +557,10 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
             if (!t) return false;
             if (t === 'Copy' || t === 'Download' || t === '复制' || t === '下载') return false;
             if (t.includes('local_cmdCopyDownload')) return false;
-            if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
+            // v4.3.35: strip ONLY bare language labels (whole line). The old
+            // \b form ate real commands starting with pwsh/powershell/bash
+            // (e.g. `pwsh -File x.ps1`), breaking all pwsh-first blocks 2026-09-16.
+            if (/^(?:local_cmd|bash|sh|powershell|pwsh)(\s*#.*)?\s*$/i.test(t)) return false;
             if (/local_cmd/i.test(t) && /(?:Copy|Download|复制|下载)/i.test(t)) return false;
             return true;
         });
@@ -1279,7 +1282,8 @@ ASYNC LONG TASKS (over 60s, e.g. image gen): open the fence as local_cmd:async (
                     const cleanCmdRaw = rawBody.split(/\r?\n/).filter(line => {
                         const t = line.trim();
                         if (!t) return false;
-                        if (/^(?:local_cmd|bash|sh|powershell|pwsh)\b/i.test(t)) return false;
+                        // v4.3.35: same bare-label-only narrowing as extractPureCommand.
+                        if (/^(?:local_cmd|bash|sh|powershell|pwsh)(\s*#.*)?\s*$/i.test(t)) return false;
                         if (/^\s*(-\s*)?```/.test(line)) return false;
                         return true;
                     }).join('\n').trim();

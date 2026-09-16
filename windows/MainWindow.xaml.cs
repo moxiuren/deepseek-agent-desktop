@@ -1386,64 +1386,78 @@ namespace DeepSeek
                     if (ps.HadErrors) throw new InvalidOperationException("Start-ThreadJob not available after import");
                     ps.Streams.ClearStreams();
                 }
-                // P0-selftest-20260916: wrap user code with a preamble that repairs
-                // $env:PSModulePath + imports Utility/Management INSIDE the job
-                // runspace (ThreadJob children start without standard modules).
-                // Param-safe injection: a leading param(...) block must stay first,
-                // so insert AFTER it when present, else prepend.
+                // P1-2b-20260916: cover BARE Start-ThreadJob too (it bypasses the shim).
+                // Native -InitializationScript runs in every child runspace; feed it via
+                // $PSDefaultParameterValues so ALL Start-ThreadJob calls get the host-DLL
+                // preamble without rewriting user ScriptBlocks. (ScriptBlock values in
+                // defaults get EVALUATED at bind time, hence the Create-wrapper + closure.)
                 using (var ps = PowerShell.Create())
                 {
                     ps.Runspace = rs;
                     ps.AddScript(@"
+$global:STJInitText = 'try { $b = Split-Path ([System.Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; if (-not $b) { $b = Join-Path $env:LOCALAPPDATA ''DeepSeek-Agent'' }; foreach ($d in ''Microsoft.PowerShell.Commands.Utility.dll'',''Microsoft.PowerShell.Commands.Management.dll'',''Microsoft.PowerShell.Security.dll'') { $p = Join-Path $b $d; if (Test-Path -LiteralPath $p) { Import-Module -Name $p -EA SilentlyContinue } } } catch { }'
+$PSDefaultParameterValues['Start-ThreadJob:InitializationScript'] = { [scriptblock]::Create($global:STJInitText) }.GetNewClosure()
 function global:Start-Job {
     [CmdletBinding(DefaultParameterSetName = 'sb')]
     param(
         [Parameter(Mandatory = $true, Position = 0)] [scriptblock] $ScriptBlock,
         [object[]] $ArgumentList,
         [string] $Name,
-        [string] $WorkingDirectory
+        [string] $WorkingDirectory,
+        [scriptblock] $InitializationScript
     )
-    $pre = 'try { $b = Split-Path ([System.Reflection.Assembly]::GetAssembly([System.Management.Automation.PowerShell]).Location) -Parent; if (-not $b) { $b = Join-Path $env:LOCALAPPDATA ''DeepSeek-Agent'' }; foreach ($d in ''Microsoft.PowerShell.Commands.Utility.dll'',''Microsoft.PowerShell.Commands.Management.dll'',''Microsoft.PowerShell.Security.dll'') { $p = Join-Path $b $d; if (Test-Path -LiteralPath $p) { Import-Module -Name $p -EA SilentlyContinue } } } catch { }'
-    $src = $ScriptBlock.ToString()
-    $m = [regex]::Match($src, '(?s)^\s*param\s*\(.*?\)')
-    if ($m.Success) { $src = $src.Insert($m.Index + $m.Length, '; ' + $pre + '; ') } else { $src = $pre + '; ' + $src }
-    $sb = [scriptblock]::Create($src)
+    $sb = $ScriptBlock
     if ($WorkingDirectory) {
         $cd = ""Set-Location -LiteralPath '$($WorkingDirectory.Replace(""'"", ""''""))'; ""
         $sb = [scriptblock]::Create($cd + $sb.ToString())
     }
-    $p = @{ ScriptBlock = $sb }
+    $initText = $global:STJInitText
+    if ($InitializationScript) { $initText = $initText + '; & { ' + $InitializationScript.ToString() + ' }' }
+    $p = @{ ScriptBlock = $sb; InitializationScript = ([scriptblock]::Create($initText)) }
     if ($ArgumentList) { $p.ArgumentList = $ArgumentList }
     if ($Name) { $p.Name = $Name }
-    Start-ThreadJob @p
+    Microsoft.PowerShell.ThreadJob\Start-ThreadJob @p
 }");
                     ps.Invoke();
                     if (ps.HadErrors) throw new InvalidOperationException("Start-Job shim install failed");
                     ps.Streams.ClearStreams();
                 }
                 App.Log("[Runspace] ThreadJob compat ready (Start-Job -> Start-ThreadJob)");
-                // Zero-probe self-test: proves the shim REALLY works in this trimmed runtime
-                // (gallery ThreadJob 2.1.0 was an empty rename-shell; this guards regressions).
-                // P0-selftest-20260916: self-test now exercises REAL cmdlets (Get-Date +
-                // Start-Sleep) inside the job, not just a string literal -- a bare string
-                // passes even when standard modules are missing, which hid this bug.
+                // Zero-probe self-test: proves the shim + defaults InitScript REALLY work
+                // in this trimmed runtime (gallery ThreadJob 2.1.0 was an empty
+                // rename-shell; this guards regressions). Exercises REAL cmdlets
+                // (Get-Date + Start-Sleep) on BOTH legs — a bare string passes even
+                // when standard modules are missing, which hid the original bug.
                 try
                 {
                     using var tst = PowerShell.Create();
                     tst.Runspace = rs;
-                    tst.AddScript("$tj = Start-Job { Get-Date | Out-Null; Start-Sleep -Milliseconds 200; 'THREADJOB-SELFTEST-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
-                    var tres = tst.Invoke();
-                    string joined = "";
-                    try { foreach (var o in tres) joined += (o?.ToString() ?? "") + "|"; } catch { }
-                    if (!tst.HadErrors && joined.Contains("THREADJOB-SELFTEST-OK"))
-                        App.Log("[Runspace] ThreadJob selftest: OK");
-                    else
+                    // P1-2b-20260916: two legs — shimmed Start-Job AND bare Start-ThreadJob
+                    // (unqualified on purpose: proves real-world name resolution too).
+                    string legOut1 = "", legErr1 = ""; bool legOk1 = false;
+                    string legOut2 = "", legErr2 = ""; bool legOk2 = false;
+                    using (var t1 = PowerShell.Create())
                     {
-                        string err = "";
-                        try { foreach (var e in tst.Streams.Error) err += e.ToString() + " // "; } catch { }
-                        App.Log($"[Runspace] ThreadJob selftest: FAIL out=[{joined}] err=[{err}]");
+                        t1.Runspace = rs;
+                        t1.AddScript("$tj = Start-Job { Get-Date | Out-Null; Start-Sleep -Milliseconds 200; 'SHIM-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
+                        var rr1 = t1.Invoke();
+                        try { foreach (var o in rr1) legOut1 += (o?.ToString() ?? "") + "|"; } catch { }
+                        try { foreach (var e in t1.Streams.Error) legErr1 += e.ToString() + " // "; } catch { }
+                        legOk1 = !t1.HadErrors && legOut1.Contains("SHIM-OK");
                     }
-                    tst.Streams.ClearStreams();
+                    using (var t2 = PowerShell.Create())
+                    {
+                        t2.Runspace = rs;
+                        t2.AddScript("$tj = Start-ThreadJob { Get-Date | Out-Null; Start-Sleep -Milliseconds 200; 'BARE-OK' }; $r = $tj | Wait-Job -Timeout 20 | Receive-Job; $tj | Remove-Job -Force -ErrorAction SilentlyContinue; $r");
+                        var rr2 = t2.Invoke();
+                        try { foreach (var o in rr2) legOut2 += (o?.ToString() ?? "") + "|"; } catch { }
+                        try { foreach (var e in t2.Streams.Error) legErr2 += e.ToString() + " // "; } catch { }
+                        legOk2 = !t2.HadErrors && legOut2.Contains("BARE-OK");
+                    }
+                    if (legOk1 && legOk2)
+                        App.Log("[Runspace] ThreadJob selftest: OK(shim+bare)");
+                    else
+                        App.Log($"[Runspace] ThreadJob selftest: FAIL shim=[{legOut1}] shimErr=[{legErr1}] bare=[{legOut2}] bareErr=[{legErr2}]");
                 }
                 catch (Exception ex) { App.Log($"[Runspace] ThreadJob selftest: EXCEPTION {ex.Message}"); }
             }
