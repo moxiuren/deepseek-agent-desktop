@@ -40,6 +40,9 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <EmbeddedResource Include="..\agent_bridge.js" Link="Resources\agent_bridge.js" />
+    <!-- DSX builtins: whale-dsh + token-meter shipped inside the DLL (delete-safe, no seed needed) -->
+    <EmbeddedResource Include="plugins\whale-dsh.js" Link="Resources\plugins\whale-dsh.js" />
+    <EmbeddedResource Include="plugins\token-meter.js" Link="Resources\plugins\token-meter.js" />
     <!-- ThreadJob module (Start-ThreadJob backend for Start-Job shim + async lane): ship beside the exe -->
     <None Include="Modules\**" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\api_sniff.js" Link="api_sniff.js">

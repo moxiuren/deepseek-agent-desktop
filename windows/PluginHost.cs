@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -30,6 +31,14 @@ namespace DeepSeek
         private Task? _loop;
         private bool _started;
         private bool _disposed;
+        // Built-in plugins embedded in the DLL (authoritative; loose files with same name are ignored).
+        // Order matters: token-meter first (exposes window.__TM.whale), whale-dsh second (reads it).
+        private static readonly (string Name, string Version, string Suffix)[] Builtins = new[]
+        {
+            ("token-meter", "5.0.0", "token-meter.js"),
+            ("whale-dsh", "0.3.0", "whale-dsh.js"),
+        };
+        private bool _builtinsEnsured;
 
         public PluginHost(Func<string, Task<string>> evaluate, string pluginDir)
         {
@@ -70,6 +79,22 @@ namespace DeepSeek
                         if (!ready)
                         {
                             App.Log("[DSX] runtime missing (page reload?), waiting for doc-created auto-install...");
+                            await Task.Delay(PollMs, ct);
+                            continue;
+                        }
+                        if (!_builtinsEnsured)
+                            await EnsureBuiltinsAsync();
+                        else
+                            await ReensureMissingBuiltinsAsync();
+                    }
+
+                    if (!_builtinsEnsured)
+                    {
+                        // First run: don't wait for the 3s health tick, load ASAP once runtime answers.
+                        if (await IsRuntimeReadyAsync(ct))
+                            await EnsureBuiltinsAsync();
+                        else
+                        {
                             await Task.Delay(PollMs, ct);
                             continue;
                         }
@@ -127,9 +152,79 @@ namespace DeepSeek
             var map = new Dictionary<string, long>();
             foreach (var f in Directory.GetFiles(_pluginDir, "*.js"))
             {
+                // Builtins are served from embedded resources; loose copies are ignored (delete-safe).
+                if (IsBuiltin(Path.GetFileNameWithoutExtension(f))) continue;
                 try { map[f] = File.GetLastWriteTimeUtc(f).Ticks; } catch { }
             }
             return map;
+        }
+
+        private static bool IsBuiltin(string name)
+        {
+            foreach (var b in Builtins)
+                if (string.Equals(b.Name, name, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static string ReadEmbeddedText(string suffix)
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            foreach (string res in asm.GetManifestResourceNames())
+            {
+                if (res.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    using var s = asm.GetManifestResourceStream(res);
+                    if (s == null) continue;
+                    using var r = new StreamReader(s, Encoding.UTF8);
+                    return r.ReadToEnd();
+                }
+            }
+            return "";
+        }
+
+        /// <summary>Loads embedded token-meter + whale-dsh in dependency order. Safe to call once.</summary>
+        public async Task EnsureBuiltinsAsync()
+        {
+            foreach (var b in Builtins)
+            {
+                string src = ReadEmbeddedText(b.Suffix);
+                if (string.IsNullOrWhiteSpace(src))
+                {
+                    App.Log($"[DSX] builtin {b.Name} missing from resources (suffix {b.Suffix})");
+                    continue;
+                }
+                bool ok = await LoadSourceAsync(b.Name, b.Version, src);
+                App.Log($"[DSX] builtin {b.Name} v{b.Version} -> {(ok ? "OK" : "FAIL")} ({src.Length} chars)");
+            }
+            _builtinsEnsured = true;
+        }
+
+        /// <summary>After reload/navigation, re-inject any builtin missing from the page registry.</summary>
+        private async Task ReensureMissingBuiltinsAsync()
+        {
+            JsonElement? st = null;
+            try { st = await StatusAsync(); } catch { }
+            if (st == null) return;
+            try
+            {
+                var have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (st.Value.TryGetProperty("list", out var list) && list.ValueKind == JsonValueKind.Array)
+                    foreach (var item in list.EnumerateArray())
+                        if (item.TryGetProperty("name", out var n))
+                            have.Add(n.GetString() ?? "");
+                foreach (var b in Builtins)
+                {
+                    if (have.Contains(b.Name)) continue;
+                    string src = ReadEmbeddedText(b.Suffix);
+                    if (string.IsNullOrWhiteSpace(src)) continue;
+                    bool ok = await LoadSourceAsync(b.Name, b.Version, src);
+                    App.Log($"[DSX] builtin {b.Name} re-injected -> {(ok ? "OK" : "FAIL")}");
+                }
+            }
+            catch (Exception ex)
+            {
+                App.Log($"[DSX] builtin reensure failed: {ex.Message}");
+            }
         }
 
         public async Task<bool> IsRuntimeReadyAsync(CancellationToken ct = default)
@@ -163,7 +258,12 @@ namespace DeepSeek
             }
             if (string.IsNullOrWhiteSpace(src)) return false;
             string name = Path.GetFileNameWithoutExtension(file);
-            var meta = new { name = name, version = "1.0.0", file = file, builtin = true };
+            return await LoadSourceAsync(name, "1.0.0", src);
+        }
+
+        private async Task<bool> LoadSourceAsync(string name, string version, string src)
+        {
+            var meta = new { name = name, version = version, builtin = true };
             string metaB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(meta)));
             string srcB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(src));
             string js = "window.__DSX.load(JSON.parse(decodeURIComponent(escape(atob('" + metaB64 + "')))), decodeURIComponent(escape(atob('" + srcB64 + "'))))";
